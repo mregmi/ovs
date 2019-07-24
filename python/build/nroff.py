@@ -80,23 +80,24 @@ def inline_xml_to_nroff(node, font, to_upper=False, newline='\n'):
                 s += inline_xml_to_nroff(child, r'\fB', to_upper, newline)
             return s + font
         elif node.tagName == 'ref':
-            s = r'\fB'
             if node.hasAttribute('column'):
-                s += node.attributes['column'].nodeValue
+                s = node.attributes['column'].nodeValue
                 if node.hasAttribute('key'):
                     s += ':' + node.attributes['key'].nodeValue
             elif node.hasAttribute('table'):
-                s += node.attributes['table'].nodeValue
+                s = node.attributes['table'].nodeValue
             elif node.hasAttribute('group'):
-                s += node.attributes['group'].nodeValue
+                s = node.attributes['group'].nodeValue
             elif node.hasAttribute('db'):
-                s += node.attributes['db'].nodeValue
+                s = node.attributes['db'].nodeValue
             elif node.hasAttribute('field'):
-                s += node.attributes['field'].nodeValue
+                s = node.attributes['field'].nodeValue
+            elif node.hasAttribute('section'):
+                s = node.attributes['section'].nodeValue
             else:
                 raise error.Error("'ref' lacks required attributes: %s"
                                   % list(node.attributes.keys()))
-            return s + font
+            return r'\fB' + re.sub(r'\s+', ' ', s) + font
         elif node.tagName in ['var', 'dfn', 'i', 'cite']:
             s = r'\fI'
             for child in node.childNodes:
@@ -273,7 +274,7 @@ def diagram_to_nroff(nodes, para):
     text_s = '.br\n'.join(["\\fL%s\n" % s for s in text if s != ""])
     return para + """
 .\\" check if in troff mode (TTY)
-.if t \{
+.if t \\{
 .PS
 boxht = .2
 textht = 1/6
@@ -282,7 +283,7 @@ fillval = .2
 .PE
 \\}
 .\\" check if in nroff mode:
-.if n \{
+.if n \\{
 .nf
 """ + text_s + """\
 .fi
@@ -315,7 +316,7 @@ def block_xml_to_nroff(nodes, para='.PP'):
                         if node.tagName == 'ul':
                             s += ".IP \\(bu\n"
                         else:
-                            s += ".IP %d. .25in\n" % i
+                            s += ".IP %d. .4in\n" % i
                         s += block_xml_to_nroff(li_node.childNodes, ".IP")
                     elif li_node.nodeType == node.COMMENT_NODE:
                         pass
@@ -365,14 +366,14 @@ def block_xml_to_nroff(nodes, para='.PP'):
                 if s != "":
                     if not s.endswith("\n"):
                         s += "\n"
-                nroffTag = {'h1': 'SH',
-                            'h2': 'SS',
-                            'h3': 'ST',
-                            'h4': 'SU'}[node.tagName]
+                nroffTag, font = {'h1': ('SH', r'\fR'),
+                                  'h2': ('SS', r'\fB'),
+                                  'h3': ('ST', r'\fI'),
+                                  'h4': ('SU', r'\fI')}[node.tagName]
                 to_upper = node.tagName == 'h1'
                 s += ".%s \"" % nroffTag
                 for child_node in node.childNodes:
-                    s += inline_xml_to_nroff(child_node, r'\fR', to_upper)
+                    s += inline_xml_to_nroff(child_node, font, to_upper)
                 s += "\"\n"
             elif node.tagName == 'pre':
                 fixed = node.getAttribute('fixed')

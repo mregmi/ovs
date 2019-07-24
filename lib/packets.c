@@ -16,12 +16,14 @@
 
 #include <config.h>
 #include "packets.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <stdlib.h>
+#include <netdb.h>
 #include "byte-order.h"
 #include "csum.h"
 #include "crc32c.h"
@@ -49,6 +51,13 @@ flow_tnl_src(const struct flow_tnl *tnl)
     return tnl->ip_src ? in6_addr_mapped_ipv4(tnl->ip_src) : tnl->ipv6_src;
 }
 
+/* Returns true if 's' consists entirely of hex digits, false otherwise. */
+static bool
+is_all_hex(const char *s)
+{
+    return s[strspn(s, "0123456789abcdefABCDEF")] == '\0';
+}
+
 /* Parses 's' as a 16-digit hexadecimal number representing a datapath ID.  On
  * success stores the dpid into '*dpidp' and returns true, on failure stores 0
  * into '*dpidp' and returns false.
@@ -57,7 +66,10 @@ flow_tnl_src(const struct flow_tnl *tnl)
 bool
 dpid_from_string(const char *s, uint64_t *dpidp)
 {
-    *dpidp = (strlen(s) == 16 && strspn(s, "0123456789abcdefABCDEF") == 16
+    size_t len = strlen(s);
+    *dpidp = ((len == 16 && is_all_hex(s))
+              || (len <= 18 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
+                  && is_all_hex(s + 2))
               ? strtoull(s, NULL, 16)
               : 0);
     return *dpidp != 0;
@@ -403,10 +415,10 @@ pop_mpls(struct dp_packet *packet, ovs_be16 ethtype)
 }
 
 void
-encap_nsh(struct dp_packet *packet, const struct ovs_action_encap_nsh *encap)
+push_nsh(struct dp_packet *packet, const struct nsh_hdr *nsh_hdr_src)
 {
     struct nsh_hdr *nsh;
-    size_t length = NSH_BASE_HDR_LEN + encap->mdlen;
+    size_t length = nsh_hdr_len(nsh_hdr_src);
     uint8_t next_proto;
 
     switch (ntohl(packet->packet_type)) {
@@ -427,31 +439,15 @@ encap_nsh(struct dp_packet *packet, const struct ovs_action_encap_nsh *encap)
     }
 
     nsh = (struct nsh_hdr *) dp_packet_push_uninit(packet, length);
-    nsh->ver_flags_len = htons(encap->flags << NSH_FLAGS_SHIFT | length >> 2);
+    memcpy(nsh, nsh_hdr_src, length);
     nsh->next_proto = next_proto;
-    put_16aligned_be32(&nsh->path_hdr, encap->path_hdr);
-    nsh->md_type = encap->mdtype;
-    switch (nsh->md_type) {
-        case NSH_M_TYPE1:
-            nsh->md1 = *ALIGNED_CAST(struct nsh_md1_ctx *, encap->metadata);
-            break;
-        case NSH_M_TYPE2: {
-            /* The MD2 metadata in encap is already padded to 4 bytes. */
-            size_t len = ROUND_UP(encap->mdlen, 4);
-            memcpy(&nsh->md2, encap->metadata, len);
-            break;
-        }
-        default:
-            OVS_NOT_REACHED();
-    }
-
     packet->packet_type = htonl(PT_NSH);
     dp_packet_reset_offsets(packet);
     packet->l3_ofs = 0;
 }
 
 bool
-decap_nsh(struct dp_packet *packet)
+pop_nsh(struct dp_packet *packet)
 {
     struct nsh_hdr *nsh = (struct nsh_hdr *) dp_packet_l3(packet);
     size_t length;
@@ -1285,6 +1281,83 @@ packet_set_icmp(struct dp_packet *packet, uint8_t type, uint8_t code)
     }
 }
 
+/* Sets the IGMP type to IGMP_HOST_MEMBERSHIP_QUERY and populates the
+ * v3 query header fields in 'packet'. 'packet' must be a valid IGMPv3
+ * query packet with its l4 offset properly populated.
+ */
+void
+packet_set_igmp3_query(struct dp_packet *packet, uint8_t max_resp,
+                       ovs_be32 group, bool srs, uint8_t qrv, uint8_t qqic)
+{
+    struct igmpv3_query_header *igh = dp_packet_l4(packet);
+    ovs_be16 orig_type_max_resp =
+        htons(igh->type << 8 | igh->max_resp);
+    ovs_be16 new_type_max_resp =
+        htons(IGMP_HOST_MEMBERSHIP_QUERY << 8 | max_resp);
+
+    if (orig_type_max_resp != new_type_max_resp) {
+        igh->type = IGMP_HOST_MEMBERSHIP_QUERY;
+        igh->max_resp = max_resp;
+        igh->csum = recalc_csum16(igh->csum, orig_type_max_resp,
+                                  new_type_max_resp);
+    }
+
+    ovs_be32 old_group = get_16aligned_be32(&igh->group);
+
+    if (old_group != group) {
+        put_16aligned_be32(&igh->group, group);
+        igh->csum = recalc_csum32(igh->csum, old_group, group);
+    }
+
+    /* See RFC 3376 4.1.6. */
+    if (qrv > 7) {
+        qrv = 0;
+    }
+
+    ovs_be16 orig_srs_qrv_qqic = htons(igh->srs_qrv << 8 | igh->qqic);
+    ovs_be16 new_srs_qrv_qqic = htons(srs << 11 | qrv << 8 | qqic);
+
+    if (orig_srs_qrv_qqic != new_srs_qrv_qqic) {
+        igh->srs_qrv = (srs << 3 | qrv);
+        igh->qqic = qqic;
+        igh->csum = recalc_csum16(igh->csum, orig_srs_qrv_qqic,
+                                  new_srs_qrv_qqic);
+    }
+}
+
+void
+packet_set_nd_ext(struct dp_packet *packet, const ovs_16aligned_be32 rso_flags,
+                  const uint8_t opt_type)
+{
+    struct ovs_nd_msg *ns;
+    struct ovs_nd_lla_opt *opt;
+    int bytes_remain = dp_packet_l4_size(packet);
+    struct ovs_16aligned_ip6_hdr * nh = dp_packet_l3(packet);
+    uint32_t pseudo_hdr_csum = 0;
+
+    if (OVS_UNLIKELY(bytes_remain < sizeof(*ns))) {
+        return;
+    }
+
+    if (nh) {
+        pseudo_hdr_csum = packet_csum_pseudoheader6(nh);
+    }
+
+    ns = dp_packet_l4(packet);
+    opt = &ns->options[0];
+
+    /* set RSO flags and option type */
+    ns->rso_flags = rso_flags;
+    opt->type = opt_type;
+
+    /* recalculate checksum */
+    ovs_be16 *csum_value = &(ns->icmph.icmp6_cksum);
+    *csum_value = 0;
+    *csum_value = csum_finish(csum_continue(pseudo_hdr_csum,
+                              &(ns->icmph), bytes_remain));
+
+}
+
 void
 packet_set_nd(struct dp_packet *packet, const struct in6_addr *target,
               const struct eth_addr sll, const struct eth_addr tll)
@@ -1564,7 +1637,7 @@ compose_nd_ra(struct dp_packet *b,
               const struct in6_addr *ipv6_src, const struct in6_addr *ipv6_dst,
               uint8_t cur_hop_limit, uint8_t mo_flags,
               ovs_be16 router_lt, ovs_be32 reachable_time,
-              ovs_be32 retrans_timer, ovs_be32 mtu)
+              ovs_be32 retrans_timer, uint32_t mtu)
 {
     /* Don't compose Router Advertisement packet with MTU Option if mtu
      * value is 0. */
@@ -1596,7 +1669,7 @@ compose_nd_ra(struct dp_packet *b,
         mtu_opt->type = ND_OPT_MTU;
         mtu_opt->len = 1;
         mtu_opt->reserved = 0;
-        put_16aligned_be32(&mtu_opt->mtu, mtu);
+        put_16aligned_be32(&mtu_opt->mtu, htonl(mtu));
     }
 
     ra->icmph.icmp6_cksum = 0;
@@ -1617,7 +1690,6 @@ packet_put_ra_prefix_opt(struct dp_packet *b,
     struct ip6_hdr *nh = dp_packet_l3(b);
     nh->ip6_plen = htons(prev_l4_size + ND_PREFIX_OPT_LEN);
 
-    struct ovs_ra_msg *ra = dp_packet_l4(b);
     struct ovs_nd_prefix_opt *prefix_opt =
         dp_packet_put_uninit(b, sizeof *prefix_opt);
     prefix_opt->type = ND_OPT_PREFIX_INFORMATION;
@@ -1629,6 +1701,7 @@ packet_put_ra_prefix_opt(struct dp_packet *b,
     put_16aligned_be32(&prefix_opt->reserved, 0);
     memcpy(prefix_opt->prefix.be32, prefix.be32, sizeof(ovs_be32[4]));
 
+    struct ovs_ra_msg *ra = dp_packet_l4(b);
     ra->icmph.icmp6_cksum = 0;
     uint32_t icmp_csum = packet_csum_pseudoheader6(dp_packet_l3(b));
     ra->icmph.icmp6_cksum = csum_finish(csum_continue(
@@ -1666,7 +1739,7 @@ packet_csum_pseudoheader6(const struct ovs_16aligned_ip6_hdr *ip6)
 /* Calculate the IPv6 upper layer checksum according to RFC2460. We pass the
    ip6_nxt and ip6_plen values, so it will also work if extension headers
    are present. */
-uint16_t
+ovs_be16
 packet_csum_upperlayer6(const struct ovs_16aligned_ip6_hdr *ip6,
                         const void *data, uint8_t l4_protocol,
                         uint16_t l4_size)

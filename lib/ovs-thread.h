@@ -33,11 +33,6 @@ struct ovs_barrier {
     struct seq *seq;
 };
 
-/* Wrappers for pthread_mutex_*() that abort the process on any error.
- * This is still needed when ovs-atomic-pthreads.h is used. */
-void xpthread_mutex_lock(pthread_mutex_t *mutex);
-void xpthread_mutex_unlock(pthread_mutex_t *mutex);
-
 /* Wrappers for pthread_mutexattr_*() that abort the process on any error. */
 void xpthread_mutexattr_init(pthread_mutexattr_t *);
 void xpthread_mutexattr_destroy(pthread_mutexattr_t *);
@@ -260,7 +255,7 @@ void xpthread_join(pthread_t, void **);
     static inline NAME##_type *                                         \
     NAME##_get_unsafe(void)                                             \
     {                                                                   \
-        return &NAME##_var;                                             \
+        return (NAME##_type *)&NAME##_var;                              \
     }                                                                   \
                                                                         \
     static inline NAME##_type *                                         \
@@ -316,7 +311,7 @@ void xpthread_join(pthread_t, void **);
     static inline NAME##_type *                                         \
     NAME##_get_unsafe(void)                                             \
     {                                                                   \
-        return pthread_getspecific(NAME##_key);                         \
+        return (NAME##_type *)pthread_getspecific(NAME##_key);          \
     }                                                                   \
                                                                         \
     NAME##_type *NAME##_get(void);
@@ -465,14 +460,24 @@ void *ovsthread_getspecific(ovsthread_key_t);
  * This thread ID avoids the problem.
  */
 
+#define OVSTHREAD_ID_UNSET UINT_MAX
 DECLARE_EXTERN_PER_THREAD_DATA(unsigned int, ovsthread_id);
+
+/* Initializes the unique per thread identifier */
+unsigned int ovsthread_id_init(void);
 
 /* Returns a per-thread identifier unique within the lifetime of the
  * process. */
 static inline unsigned int
 ovsthread_id_self(void)
 {
-    return *ovsthread_id_get();
+    unsigned int id = *ovsthread_id_get();
+
+    if (OVS_UNLIKELY(id == OVSTHREAD_ID_UNSET)) {
+        id = ovsthread_id_init();
+    }
+
+    return id;
 }
 
 /* Simulated global counter.

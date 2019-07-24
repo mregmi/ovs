@@ -37,7 +37,10 @@
 #include "netdev.h"
 #include "openflow/openflow.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "ovs-rcu.h"
+#include "ovs-router.h"
+#include "ovs-thread.h"
+#include "openvswitch/poll-loop.h"
 #include "simap.h"
 #include "stream-ssl.h"
 #include "stream.h"
@@ -48,6 +51,7 @@
 #include "openvswitch/vconn.h"
 #include "openvswitch/vlog.h"
 #include "lib/vswitch-idl.h"
+#include "lib/dns-resolve.h"
 
 VLOG_DEFINE_THIS_MODULE(vswitchd);
 
@@ -76,7 +80,9 @@ main(int argc, char *argv[])
     int retval;
 
     set_program_name(argv[0]);
+    ovsthread_id_init();
 
+    dns_resolve_init(true);
     ovs_cmdl_proctitle_init(argc, argv);
     service_start(&argc, &argv);
     remote = parse_options(argc, argv, &unixctl_path);
@@ -88,6 +94,8 @@ main(int argc, char *argv[])
 #ifdef HAVE_MLOCKALL
         if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
             VLOG_ERR("mlockall failed: %s", ovs_strerror(errno));
+        } else {
+            set_memory_locked();
         }
 #else
         VLOG_ERR("mlockall not supported on this system");
@@ -135,6 +143,9 @@ main(int argc, char *argv[])
     bridge_exit(cleanup);
     unixctl_server_destroy(unixctl);
     service_stop();
+    vlog_disable_async();
+    ovsrcu_exit();
+    dns_resolve_destroy();
 
     return 0;
 }
@@ -150,6 +161,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
         OPT_BOOTSTRAP_CA_CERT,
         OPT_ENABLE_DUMMY,
         OPT_DISABLE_SYSTEM,
+        OPT_DISABLE_SYSTEM_ROUTE,
         DAEMON_OPTION_ENUMS,
         OPT_DPDK,
         SSL_OPTION_ENUMS,
@@ -167,6 +179,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
         {"bootstrap-ca-cert", required_argument, NULL, OPT_BOOTSTRAP_CA_CERT},
         {"enable-dummy", optional_argument, NULL, OPT_ENABLE_DUMMY},
         {"disable-system", no_argument, NULL, OPT_DISABLE_SYSTEM},
+        {"disable-system-route", no_argument, NULL, OPT_DISABLE_SYSTEM_ROUTE},
         {"dpdk", optional_argument, NULL, OPT_DPDK},
         {"dummy-numa", required_argument, NULL, OPT_DUMMY_NUMA},
         {NULL, 0, NULL, 0},
@@ -187,6 +200,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
 
         case 'V':
             ovs_print_version(0, 0);
+            print_dpdk_version();
             exit(EXIT_SUCCESS);
 
         case OPT_MLOCKALL:
@@ -215,6 +229,10 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
 
         case OPT_DISABLE_SYSTEM:
             dp_blacklist_provider("system");
+            break;
+
+        case OPT_DISABLE_SYSTEM_ROUTE:
+            ovs_router_disable_system_routing_table();
             break;
 
         case '?':

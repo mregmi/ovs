@@ -81,6 +81,7 @@
 #include "Flow.h"
 #include "Offload.h"
 #include "NetProto.h"
+#include "PacketIO.h"
 #include "PacketParser.h"
 #include "Switch.h"
 #include "Vport.h"
@@ -259,20 +260,23 @@ static VOID
 OvsInitNBLContext(POVS_BUFFER_CONTEXT ctx,
                   UINT16 flags,
                   UINT32 origDataLength,
-                  UINT32 srcPortNo)
+                  UINT32 srcPortNo,
+                  UINT16 mru)
 {
     ctx->magic = OVS_CTX_MAGIC;
     ctx->refCount = 1;
     ctx->flags = flags;
     ctx->srcPortNo = srcPortNo;
     ctx->origDataLength = origDataLength;
-    ctx->mru = 0;
+    ctx->mru = mru;
+    ctx->pendingSend = 0;
 }
 
 
 static VOID
 OvsDumpForwardingDetails(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNDIS_SWITCH_FORWARDING_DETAIL_NET_BUFFER_LIST_INFO info;
     info = NET_BUFFER_LIST_SWITCH_FORWARDING_DETAIL(nbl);
     if (info == NULL) {
@@ -284,12 +288,15 @@ OvsDumpForwardingDetails(PNET_BUFFER_LIST nbl)
                  info->SourceNicIndex,
                  info->IsPacketDataSafe ? "TRUE" : "FALSE",
                  info->IsPacketDataSafe ? 0 : info->SafePacketDataSize);
-
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 static VOID
 OvsDumpNBLContext(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNET_BUFFER_LIST_CONTEXT ctx = nbl->Context;
     if (ctx == NULL) {
         OVS_LOG_INFO("No Net Buffer List context");
@@ -300,6 +307,9 @@ OvsDumpNBLContext(PNET_BUFFER_LIST nbl)
                      nbl, ctx, ctx->Size, ctx->Offset);
         ctx = ctx->Next;
     }
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 
@@ -337,6 +347,7 @@ OvsDumpNetBuffer(PNET_BUFFER nb)
 static VOID
 OvsDumpNetBufferList(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNET_BUFFER nb;
     OVS_LOG_INFO("NBL: %p, parent: %p, SrcHandle: %p, ChildCount:%d "
                  "poolHandle: %p",
@@ -349,6 +360,9 @@ OvsDumpNetBufferList(PNET_BUFFER_LIST nbl)
         OvsDumpNetBuffer(nb);
         nb = NET_BUFFER_NEXT_NB(nb);
     }
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 /*
@@ -421,7 +435,7 @@ OvsAllocateFixSizeNBL(PVOID ovsContext,
 
     OvsInitNBLContext(ctx, OVS_BUFFER_FROM_FIX_SIZE_POOL |
                       OVS_BUFFER_PRIVATE_FORWARD_CONTEXT, size,
-                      OVS_DPPORT_NUMBER_INVALID);
+                      OVS_DPPORT_NUMBER_INVALID, 0);
     line = __LINE__;
 allocate_done:
     OVS_LOG_LOUD("Allocate Fix NBL: %p, line: %d", nbl, line);
@@ -534,7 +548,7 @@ OvsAllocateVariableSizeNBL(PVOID ovsContext,
     OvsInitNBLContext(ctx, OVS_BUFFER_PRIVATE_MDL | OVS_BUFFER_PRIVATE_DATA |
                            OVS_BUFFER_PRIVATE_FORWARD_CONTEXT |
                            OVS_BUFFER_FROM_ZERO_SIZE_POOL,
-                           size, OVS_DPPORT_NUMBER_INVALID);
+                           size, OVS_DPPORT_NUMBER_INVALID, 0);
 
     OVS_LOG_LOUD("Allocate variable size NBL: %p", nbl);
     return nbl;
@@ -587,7 +601,7 @@ OvsInitExternalNBLContext(PVOID ovsContext,
      * complete.
      */
     OvsInitNBLContext(ctx, flags, NET_BUFFER_DATA_LENGTH(nb),
-                      OVS_DPPORT_NUMBER_INVALID);
+                      OVS_DPPORT_NUMBER_INVALID, 0);
     return ctx;
 }
 
@@ -804,7 +818,7 @@ OvsPartialCopyNBL(PVOID ovsContext,
     srcNb = NET_BUFFER_LIST_FIRST_NB(nbl);
     ASSERT(srcNb);
     OvsInitNBLContext(dstCtx, flags, NET_BUFFER_DATA_LENGTH(srcNb) - copySize,
-                      OVS_DPPORT_NUMBER_INVALID);
+                      OVS_DPPORT_NUMBER_INVALID, srcCtx->mru);
 
     InterlockedIncrement((LONG volatile *)&srcCtx->refCount);
 
@@ -1061,7 +1075,7 @@ OvsFullCopyNBL(PVOID ovsContext,
              OVS_BUFFER_PRIVATE_FORWARD_CONTEXT;
 
     OvsInitNBLContext(dstCtx, flags, NET_BUFFER_DATA_LENGTH(firstNb),
-                      OVS_DPPORT_NUMBER_INVALID);
+                      OVS_DPPORT_NUMBER_INVALID, srcCtx->mru);
 
 #ifdef DBG
     OvsDumpNetBufferList(nbl);
@@ -1090,9 +1104,9 @@ nblcopy_error:
 
 NDIS_STATUS
 GetIpHeaderInfo(PNET_BUFFER_LIST curNbl,
+                const POVS_PACKET_HDR_INFO hdrInfo,
                 UINT32 *hdrSize)
 {
-    CHAR *ethBuf[sizeof(EthHdr)];
     EthHdr *eth;
     IPHdr *ipHdr;
     PNET_BUFFER curNb;
@@ -1100,16 +1114,14 @@ GetIpHeaderInfo(PNET_BUFFER_LIST curNbl,
     curNb = NET_BUFFER_LIST_FIRST_NB(curNbl);
     ASSERT(NET_BUFFER_NEXT_NB(curNb) == NULL);
 
-    eth = (EthHdr *)NdisGetDataBuffer(curNb, ETH_HEADER_LENGTH,
-                                      (PVOID)&ethBuf, 1, 0);
+    eth = (EthHdr *)NdisGetDataBuffer(curNb,
+                                      hdrInfo->l4Offset,
+                                      NULL, 1, 0);
     if (eth == NULL) {
         return NDIS_STATUS_INVALID_PACKET;
     }
-    ipHdr = (IPHdr *)((PCHAR)eth + ETH_HEADER_LENGTH);
-    if (ipHdr == NULL) {
-        return NDIS_STATUS_INVALID_PACKET;
-    }
-    *hdrSize = (UINT32)(ETH_HEADER_LENGTH + (ipHdr->ihl * 4));
+    ipHdr = (IPHdr *)((PCHAR)eth + hdrInfo->l3Offset);
+    *hdrSize = (UINT32)(hdrInfo->l3Offset + (ipHdr->ihl * 4));
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -1157,7 +1169,7 @@ FixFragmentHeader(PNET_BUFFER nb, UINT16 fragmentSize,
 
     mdl = NET_BUFFER_FIRST_MDL(nb);
 
-    bufferStart = (PUINT8)MmGetSystemAddressForMdlSafe(mdl, LowPagePriority);
+    bufferStart = (PUINT8)OvsGetMdlWithLowPriority(mdl);
     if (!bufferStart) {
         return NDIS_STATUS_RESOURCES;
     }
@@ -1215,7 +1227,7 @@ FixSegmentHeader(PNET_BUFFER nb, UINT16 segmentSize, UINT32 seqNumber,
 
     mdl = NET_BUFFER_FIRST_MDL(nb);
 
-    bufferStart = (PUINT8)MmGetSystemAddressForMdlSafe(mdl, LowPagePriority);
+    bufferStart = (PUINT8)OvsGetMdlWithLowPriority(mdl);
     if (!bufferStart) {
         return NDIS_STATUS_RESOURCES;
     }
@@ -1369,7 +1381,7 @@ OvsFragmentNBL(PVOID ovsContext,
 
     /* Figure out the header size */
     if (isIpFragment) {
-        status = GetIpHeaderInfo(nbl, &hdrSize);
+        status = GetIpHeaderInfo(nbl, hdrInfo, &hdrSize);
     } else {
         status = GetSegmentHeaderInfo(nbl, hdrInfo, &hdrSize, &seqNumber);
     }
@@ -1521,8 +1533,8 @@ OvsAllocateNBLFromBuffer(PVOID context,
 
     nb = NET_BUFFER_LIST_FIRST_NB(nbl);
     mdl = NET_BUFFER_CURRENT_MDL(nb);
-    data = (PUINT8)MmGetSystemAddressForMdlSafe(mdl, LowPagePriority) +
-                    NET_BUFFER_CURRENT_MDL_OFFSET(nb);
+    data = (PUINT8)OvsGetMdlWithLowPriority(mdl)
+        + NET_BUFFER_CURRENT_MDL_OFFSET(nb);
     if (!data) {
         OvsCompleteNBL(switchContext, nbl, TRUE);
         return NULL;
@@ -1605,16 +1617,18 @@ copymultiple_error:
  * --------------------------------------------------------------------------
  */
 PNET_BUFFER_LIST
-OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
+OvsCompleteNBL(PVOID switch_ctx,
                PNET_BUFFER_LIST nbl,
                BOOLEAN updateRef)
 {
     POVS_BUFFER_CONTEXT ctx;
     UINT16 flags;
+    UINT32 dataOffsetDelta;
     PNET_BUFFER_LIST parent;
     NDIS_STATUS status;
     NDIS_HANDLE poolHandle;
     LONG value;
+    POVS_SWITCH_CONTEXT context = (POVS_SWITCH_CONTEXT)switch_ctx;
     POVS_NBL_POOL ovsPool = &context->ovsPool;
     PNET_BUFFER nb;
 
@@ -1641,6 +1655,7 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
     nb = NET_BUFFER_LIST_FIRST_NB(nbl);
 
     flags = ctx->flags;
+    dataOffsetDelta = ctx->dataOffsetDelta;
     if (!(flags & OVS_BUFFER_FRAGMENT) &&
         NET_BUFFER_DATA_LENGTH(nb) != ctx->origDataLength) {
         UINT32 diff;
@@ -1655,7 +1670,7 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
         }
     }
 
-    if (ctx->flags & OVS_BUFFER_PRIVATE_CONTEXT) {
+    if (flags & OVS_BUFFER_PRIVATE_CONTEXT) {
         NdisFreeNetBufferListContext(nbl, sizeof (OVS_BUFFER_CONTEXT));
     }
 
@@ -1728,14 +1743,19 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
 #ifdef DBG
         InterlockedDecrement((LONG volatile *)&ovsPool->fragNBLCount);
 #endif
-        NdisFreeFragmentNetBufferList(nbl, ctx->dataOffsetDelta, 0);
+        NdisFreeFragmentNetBufferList(nbl, dataOffsetDelta, 0);
     }
 
     if (parent != NULL) {
         ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(parent);
         ASSERT(ctx && ctx->magic == OVS_CTX_MAGIC);
+        UINT16 pendingSend = 1, exchange = 0;
         value = InterlockedDecrement((LONG volatile *)&ctx->refCount);
-        if (value == 0) {
+        InterlockedCompareExchange16((SHORT volatile *)&pendingSend, exchange, (SHORT)ctx->pendingSend);
+        if (value == 1 && pendingSend == exchange) {
+            InterlockedExchange16((SHORT volatile *)&ctx->pendingSend, 0);
+            OvsSendNBLIngress(context, parent, ctx->sendFlags);
+        } else if (value == 0){
             return OvsCompleteNBL(context, parent, FALSE);
         }
     }

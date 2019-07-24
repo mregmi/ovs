@@ -25,10 +25,10 @@
 #undef OVS_DBG_MOD
 #endif
 #define OVS_DBG_MOD OVS_DBG_IPFRAG
-/* Based on MIN_FRAGMENT_SIZE.*/
-#define MAX_FRAGMENTS 164
+
 #define MIN_FRAGMENT_SIZE 400
 #define MAX_IPDATAGRAM_SIZE 65535
+#define MAX_FRAGMENTS MAX_IPDATAGRAM_SIZE/MIN_FRAGMENT_SIZE + 1
 
 /* Function declarations */
 static KSTART_ROUTINE OvsIpFragmentEntryCleaner;
@@ -140,7 +140,7 @@ OvsIpv4Reassemble(POVS_SWITCH_CONTEXT switchContext,
                   OvsCompletionList *completionList,
                   NDIS_SWITCH_PORT_ID sourcePort,
                   POVS_IPFRAG_ENTRY entry,
-                  PNET_BUFFER_LIST *newNbl)
+                  POVS_PACKET_HDR_INFO layers)
 {
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
     NDIS_STRING filterReason;
@@ -148,29 +148,27 @@ OvsIpv4Reassemble(POVS_SWITCH_CONTEXT switchContext,
     PNET_BUFFER curNb;
     EthHdr *eth;
     IPHdr *ipHdr, *newIpHdr;
-    CHAR *ethBuf[sizeof(EthHdr)];
     CHAR *packetBuf;
-    UINT16 ipHdrLen, packetHeader;
     POVS_FRAGMENT_LIST head = NULL;
+    PNET_BUFFER_LIST newNbl = NULL;
+    UINT16 ipHdrLen, packetHeader;
     UINT32 packetLen;
 
     curNb = NET_BUFFER_LIST_FIRST_NB(*curNbl);
     ASSERT(NET_BUFFER_NEXT_NB(curNb) == NULL);
 
-    eth = (EthHdr*)NdisGetDataBuffer(curNb, ETH_HEADER_LENGTH,
-                                     (PVOID)&ethBuf, 1, 0);
+    eth = (EthHdr*)NdisGetDataBuffer(curNb, layers->l4Offset,
+                                     NULL, 1, 0);
     if (eth == NULL) {
         return NDIS_STATUS_INVALID_PACKET;
     }
-    ipHdr = (IPHdr *)((PCHAR)eth + ETH_HEADER_LENGTH);
-    if (ipHdr == NULL) {
-        return NDIS_STATUS_INVALID_PACKET;
-    }
+
+    ipHdr = (IPHdr *)((PCHAR)eth + layers->l3Offset);
     ipHdrLen = ipHdr->ihl * 4;
     if (ipHdrLen + entry->totalLen > MAX_IPDATAGRAM_SIZE) {
         return NDIS_STATUS_INVALID_LENGTH;
     }
-    packetLen = ETH_HEADER_LENGTH + ipHdrLen + entry->totalLen;
+    packetLen = layers->l3Offset + ipHdrLen + entry->totalLen;
     packetBuf = (CHAR*)OvsAllocateMemoryWithTag(packetLen,
                                                 OVS_IPFRAG_POOL_TAG);
     if (packetBuf == NULL) {
@@ -179,18 +177,18 @@ OvsIpv4Reassemble(POVS_SWITCH_CONTEXT switchContext,
     }
 
     /* copy Ethernet header */
-    NdisMoveMemory(packetBuf, eth, ETH_HEADER_LENGTH);
+    NdisMoveMemory(packetBuf, eth, layers->l3Offset);
     /* copy ipv4 header to packet buff */
-    NdisMoveMemory(packetBuf + ETH_HEADER_LENGTH, ipHdr, ipHdrLen);
+    NdisMoveMemory(packetBuf + layers->l3Offset, ipHdr, ipHdrLen);
 
     /* update new ip header */
-    newIpHdr = (IPHdr *)(packetBuf + ETH_HEADER_LENGTH);
+    newIpHdr = (IPHdr *)(packetBuf + layers->l3Offset);
     newIpHdr->frag_off = 0;
-    newIpHdr->tot_len = htons(packetLen - ETH_HEADER_LENGTH);
+    newIpHdr->tot_len = htons(packetLen - layers->l3Offset);
     newIpHdr->check = 0;
-    newIpHdr->check = IPChecksum((UINT8 *)packetBuf + ETH_HEADER_LENGTH,
+    newIpHdr->check = IPChecksum((UINT8 *)packetBuf + layers->l3Offset,
                                  ipHdrLen, 0);
-    packetHeader = ETH_HEADER_LENGTH + ipHdrLen;
+    packetHeader = layers->l3Offset + ipHdrLen;
     head = entry->head;
     while (head) {
         if ((UINT32)(packetHeader + head->offset) > packetLen) {
@@ -202,10 +200,11 @@ OvsIpv4Reassemble(POVS_SWITCH_CONTEXT switchContext,
         head = head->next;
     }
     /* Create new nbl from the flat buffer */
-    *newNbl = OvsAllocateNBLFromBuffer(switchContext, packetBuf, packetLen);
-    if (*newNbl == NULL) {
+    newNbl = OvsAllocateNBLFromBuffer(switchContext, packetBuf, packetLen);
+    if (newNbl == NULL) {
         OVS_LOG_ERROR("Insufficient resources, failed to allocate newNbl");
         status = NDIS_STATUS_RESOURCES;
+        goto cleanup;
     }
 
     /* Complete the fragment NBL */
@@ -218,9 +217,9 @@ OvsIpv4Reassemble(POVS_SWITCH_CONTEXT switchContext,
         OvsCompleteNBL(switchContext, *curNbl, TRUE);
     }
     /* Store mru in the ovs buffer context. */
-    ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(*newNbl);
+    ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(newNbl);
     ctx->mru = entry->mru;
-    *curNbl = *newNbl;
+    *curNbl = newNbl;
 cleanup:
     OvsFreeMemoryWithTag(packetBuf, OVS_IPFRAG_POOL_TAG);
     entry->markedForDelete = TRUE;
@@ -229,7 +228,7 @@ cleanup:
 /*
  *----------------------------------------------------------------------------
  * OvsProcessIpv4Fragment
- *     Reassemble the fragments once all the fragments are recieved and
+ *     Reassemble the fragments once all the fragments are received and
  *     return NDIS_STATUS_PENDING for the pending fragments
  *     XXX - Instead of copying NBls, Keep the NBLs in limbo state.
  *----------------------------------------------------------------------------
@@ -239,12 +238,11 @@ OvsProcessIpv4Fragment(POVS_SWITCH_CONTEXT switchContext,
                        PNET_BUFFER_LIST *curNbl,
                        OvsCompletionList *completionList,
                        NDIS_SWITCH_PORT_ID sourcePort,
-                       ovs_be64 tunnelId,
-                       PNET_BUFFER_LIST *newNbl)
+                       POVS_PACKET_HDR_INFO layers,
+                       ovs_be64 tunnelId)
 {
     NDIS_STATUS status = NDIS_STATUS_PENDING;
     PNET_BUFFER curNb;
-    CHAR *ethBuf[sizeof(EthHdr)];
     UINT16 offset, flags;
     UINT16 payloadLen, ipHdrLen;
     UINT32 hash;
@@ -259,25 +257,19 @@ OvsProcessIpv4Fragment(POVS_SWITCH_CONTEXT switchContext,
     curNb = NET_BUFFER_LIST_FIRST_NB(*curNbl);
     ASSERT(NET_BUFFER_NEXT_NB(curNb) == NULL);
 
-    eth = (EthHdr*)NdisGetDataBuffer(curNb, ETH_HEADER_LENGTH,
-                                     (PVOID)&ethBuf, 1, 0);
+    eth = (EthHdr*)NdisGetDataBuffer(curNb, layers->l4Offset,
+                                     NULL, 1, 0);
     if (eth == NULL) {
         return NDIS_STATUS_INVALID_PACKET;
     }
 
-    ipHdr = (IPHdr *)((PCHAR)eth + ETH_HEADER_LENGTH);
-    if (ipHdr == NULL) {
-        return NDIS_STATUS_INVALID_PACKET;
-    }
+    ipHdr = (IPHdr *)((PCHAR)eth + layers->l3Offset);
     ipHdrLen = ipHdr->ihl * 4;
     payloadLen = ntohs(ipHdr->tot_len) - ipHdrLen;
     offset = ntohs(ipHdr->frag_off) & IP_OFFSET;
     offset <<= 3;
     flags = ntohs(ipHdr->frag_off) & IP_MF;
-    /* Only the last fragment can be of smaller size.*/
-    if (flags && ntohs(ipHdr->tot_len) < MIN_FRAGMENT_SIZE) {
-        return NDIS_STATUS_INVALID_LENGTH;
-    }
+
     /*Copy fragment specific fields. */
     fragKey.protocol = ipHdr->protocol;
     fragKey.id = ipHdr->id;
@@ -305,7 +297,7 @@ OvsProcessIpv4Fragment(POVS_SWITCH_CONTEXT switchContext,
     }
 
     /* Copy payload from nbl to fragment storage. */
-    if (OvsGetPacketBytes(*curNbl, payloadLen, ETH_HEADER_LENGTH + ipHdrLen,
+    if (OvsGetPacketBytes(*curNbl, payloadLen, layers->l3Offset + ipHdrLen,
                           fragStorage->pbuff) == NULL) {
         status = NDIS_STATUS_RESOURCES;
         goto payload_copy_error;
@@ -328,7 +320,7 @@ OvsProcessIpv4Fragment(POVS_SWITCH_CONTEXT switchContext,
         NdisMoveMemory(&(entry->fragKey), &fragKey,
                        sizeof(OVS_IPFRAG_KEY));
         /* Init MRU. */
-        entry->mru = ETH_HEADER_LENGTH + ipHdrLen + payloadLen;
+        entry->mru = layers->l3Offset + ipHdrLen + payloadLen;
         entry->recvdLen += fragStorage->len;
         entry->head = entry->tail = fragStorage;
         entry->numFragments = 1;
@@ -405,16 +397,16 @@ found:
             entry->tail = fragStorage;
         }
 
-        /*Update Maximum recieved Unit */
-        entry->mru = entry->mru > (ETH_HEADER_LENGTH + ipHdrLen + payloadLen) ?
-            entry->mru : (ETH_HEADER_LENGTH + ipHdrLen + payloadLen);
+        /*Update Maximum Receive Unit */
+        entry->mru = entry->mru > (layers->l3Offset + ipHdrLen + payloadLen) ?
+            entry->mru : (layers->l3Offset + ipHdrLen + payloadLen);
         entry->numFragments++;
         if (!flags) {
             entry->totalLen = offset + payloadLen;
         }
         if (entry->recvdLen == entry->totalLen) {
             status = OvsIpv4Reassemble(switchContext, curNbl, completionList,
-                                       sourcePort, entry, newNbl);
+                                       sourcePort, entry, layers);
         }
         NdisReleaseSpinLock(&(entry->lockObj));
         return status;
@@ -444,10 +436,14 @@ OvsIpFragmentEntryCleaner(PVOID data)
     POVS_IPFRAG_THREAD_CTX context = (POVS_IPFRAG_THREAD_CTX)data;
     PLIST_ENTRY link, next;
     POVS_IPFRAG_ENTRY entry;
+    LOCK_STATE_EX lockState;
     BOOLEAN success = TRUE;
 
     while (success) {
-        LOCK_STATE_EX lockState;
+        if (ovsIpFragmentHashLockObj == NULL) {
+            /* Lock has been freed by 'OvsCleanupIpFragment()' */
+            break;
+        }
         NdisAcquireRWLockWrite(ovsIpFragmentHashLockObj, &lockState, 0);
         if (context->exit) {
             NdisReleaseRWLock(ovsIpFragmentHashLockObj, &lockState);

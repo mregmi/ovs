@@ -236,6 +236,18 @@
 #define OVS_PREFETCH_WRITE(addr)
 #endif
 
+/* Since Visual Studio 2015 there has been an effort to make offsetof a
+ * builtin_offsetof, unfortunately both implementation (the regular define and
+ * the built in one) are buggy and cause issues when using them via
+ * the C compiler.
+ * e.g.: https://bit.ly/2UvWwti
+ */
+#if _MSC_VER >= 1900
+#undef offsetof
+#define offsetof(type, member) \
+    ((size_t)((char *)&(((type *)0)->member) - (char *)0))
+#endif
+
 /* Build assertions.
  *
  * Use BUILD_ASSERT_DECL as a declaration or a statement, or BUILD_ASSERT as
@@ -243,9 +255,13 @@
 #ifdef __CHECKER__
 #define BUILD_ASSERT(EXPR) ((void) 0)
 #define BUILD_ASSERT_DECL(EXPR) extern int (*build_assert(void))[1]
-#elif defined(__cplusplus)
+#elif defined(__cplusplus) && __cplusplus >= 201103L
 #define BUILD_ASSERT(EXPR) static_assert(EXPR, "assertion failed")
 #define BUILD_ASSERT_DECL(EXPR) static_assert(EXPR, "assertion failed")
+#elif defined(__cplusplus) && __cplusplus < 201103L
+#include <boost/static_assert.hpp>
+#define BUILD_ASSERT BOOST_STATIC_ASSERT
+#define BUILD_ASSERT_DECL BOOST_STATIC_ASSERT
 #elif (__GNUC__ * 256 + __GNUC_MINOR__ >= 0x403 \
        || __has_extension(c_static_assert))
 #define BUILD_ASSERT_DECL(EXPR) _Static_assert(EXPR, #EXPR)

@@ -58,6 +58,7 @@
 #include "openvswitch/list.h"
 #include "openvswitch/match.h"
 #include "openvswitch/meta-flow.h"
+#include "logical-fields.h"
 
 struct ds;
 struct expr;
@@ -65,6 +66,7 @@ struct flow;
 struct ofpbuf;
 struct shash;
 struct simap;
+struct sset;
 
 /* "Measurement level" of a field.  See "Level of Measurement" in the large
  * comment on struct expr_symbol below for more information. */
@@ -244,6 +246,7 @@ struct expr_symbol {
     int width;
 
     const struct mf_field *field;     /* Fields only, otherwise NULL. */
+    const struct ovn_field *ovn_field;  /* OVN Fields only, otherwise NULL. */
     const struct expr_symbol *parent; /* Subfields only, otherwise NULL. */
     int parent_ofs;                   /* Subfields only, otherwise 0. */
     char *predicate;                  /* Predicates only, otherwise NULL. */
@@ -284,6 +287,9 @@ struct expr_symbol *expr_symtab_add_string(struct shash *symtab,
 struct expr_symbol *expr_symtab_add_predicate(struct shash *symtab,
                                               const char *name,
                                               const char *expansion);
+struct expr_symbol *expr_symtab_add_ovn_field(struct shash *symtab,
+                                              const char *name,
+                                              enum ovn_field_id id);
 void expr_symtab_destroy(struct shash *symtab);
 
 /* Expression type. */
@@ -382,9 +388,13 @@ expr_from_node(const struct ovs_list *node)
 void expr_format(const struct expr *, struct ds *);
 void expr_print(const struct expr *);
 struct expr *expr_parse(struct lexer *, const struct shash *symtab,
-                        const struct shash *addr_sets);
+                        const struct shash *addr_sets,
+                        const struct shash *port_groups,
+                        struct sset *addr_sets_ref);
 struct expr *expr_parse_string(const char *, const struct shash *symtab,
                                const struct shash *addr_sets,
+                               const struct shash *port_groups,
+                               struct sset *addr_sets_ref,
                                char **errorp);
 
 struct expr *expr_clone(struct expr *);
@@ -404,6 +414,7 @@ bool expr_is_normalized(const struct expr *);
 
 char *expr_parse_microflow(const char *, const struct shash *symtab,
                            const struct shash *addr_sets,
+                           const struct shash *port_groups,
                            bool (*lookup_port)(const void *aux,
                                                const char *port_name,
                                                unsigned int *portp),
@@ -486,19 +497,22 @@ void expr_constant_set_format(const struct expr_constant_set *, struct ds *);
 void expr_constant_set_destroy(struct expr_constant_set *cs);
 
 
-/* Address sets.
+/* Constant sets.
  *
- * Instead of referring to a set of value as:
+ * For example, instead of referring to a set of IP addresses as:
  *    {addr1, addr2, ..., addrN}
  * You can register a set of values and refer to them as:
  *    $name
- * The address set entries should all have integer/masked-integer values.
- * The values that don't qualify are ignored.
+ *
+ * If convert_to_integer is true, the set must contain
+ * integer/masked-integer values. The values that don't qualify
+ * are ignored.
  */
 
-void expr_addr_sets_add(struct shash *addr_sets, const char *name,
-                        const char * const *values, size_t n_values);
-void expr_addr_sets_remove(struct shash *addr_sets, const char *name);
-void expr_addr_sets_destroy(struct shash *addr_sets);
+void expr_const_sets_add(struct shash *const_sets, const char *name,
+                         const char * const *values, size_t n_values,
+                         bool convert_to_integer);
+void expr_const_sets_remove(struct shash *const_sets, const char *name);
+void expr_const_sets_destroy(struct shash *const_sets);
 
 #endif /* ovn/expr.h */

@@ -21,38 +21,21 @@
 #include "openvswitch/hmap.h"
 #include "openvswitch/list.h"
 #include "openvswitch/match.h"
-#include "openvswitch/ofp-util.h"
+#include "openvswitch/ofp-connection.h"
 #include "ofproto.h"
 #include "ofproto-provider.h"
 #include "openflow/nicira-ext.h"
 #include "openvswitch/ofp-errors.h"
+#include "openvswitch/ofp-packet.h"
 #include "openvswitch/types.h"
 
 struct nlattr;
 struct ofconn;
+struct ofputil_flow_removed;
+struct ofputil_requestforward;
 struct rule;
 struct simap;
 struct sset;
-
-/* ofproto supports two kinds of OpenFlow connections:
- *
- *   - "Primary" connections to ordinary OpenFlow controllers.  ofproto
- *     maintains persistent connections to these controllers and by default
- *     sends them asynchronous messages such as packet-ins.
- *
- *   - "Service" connections, e.g. from ovs-ofctl.  When these connections
- *     drop, it is the other side's responsibility to reconnect them if
- *     necessary.  ofproto does not send them asynchronous messages by default.
- *
- * Currently, active (tcp, ssl, unix) connections are always "primary"
- * connections and passive (ptcp, pssl, punix) connections are always "service"
- * connections.  There is no inherent reason for this, but it reflects the
- * common case.
- */
-enum ofconn_type {
-    OFCONN_PRIMARY,             /* An ordinary OpenFlow controller. */
-    OFCONN_SERVICE              /* A service connection, e.g. "ovs-ofctl". */
-};
 
 /* An asynchronous message that might need to be queued between threads. */
 struct ofproto_async_msg {
@@ -76,12 +59,14 @@ void connmgr_destroy(struct connmgr *)
 
 void connmgr_run(struct connmgr *,
                  void (*handle_openflow)(struct ofconn *,
-                                         const struct ofpbuf *ofp_msg));
+                                         const struct ovs_list *msgs));
 void connmgr_wait(struct connmgr *);
 
 void connmgr_get_memory_usage(const struct connmgr *, struct simap *usage);
 
 struct ofproto *ofconn_get_ofproto(const struct ofconn *);
+
+void connmgr_set_bundle_idle_timeout(unsigned timeout);
 
 void connmgr_retry(struct connmgr *);
 
@@ -89,9 +74,7 @@ void connmgr_retry(struct connmgr *);
 bool connmgr_has_controllers(const struct connmgr *);
 void connmgr_get_controller_info(struct connmgr *, struct shash *);
 void connmgr_free_controller_info(struct shash *);
-void connmgr_set_controllers(struct connmgr *,
-                             const struct ofproto_controller[], size_t n,
-                             uint32_t allowed_versions);
+void connmgr_set_controllers(struct connmgr *, struct shash *);
 void connmgr_reconnect(const struct connmgr *);
 
 int connmgr_set_snoops(struct connmgr *, const struct sset *snoops);
@@ -109,8 +92,9 @@ void ofconn_set_role(struct ofconn *, enum ofp12_controller_role);
 enum ofputil_protocol ofconn_get_protocol(const struct ofconn *);
 void ofconn_set_protocol(struct ofconn *, enum ofputil_protocol);
 
-enum nx_packet_in_format ofconn_get_packet_in_format(struct ofconn *);
-void ofconn_set_packet_in_format(struct ofconn *, enum nx_packet_in_format);
+enum ofputil_packet_in_format ofconn_get_packet_in_format(struct ofconn *);
+void ofconn_set_packet_in_format(struct ofconn *,
+                                 enum ofputil_packet_in_format);
 
 void ofconn_set_controller_id(struct ofconn *, uint16_t controller_id);
 
@@ -132,8 +116,8 @@ void ofconn_send_error(const struct ofconn *, const struct ofp_header *request,
 struct ofp_bundle;
 
 struct ofp_bundle *ofconn_get_bundle(struct ofconn *, uint32_t id);
-enum ofperr ofconn_insert_bundle(struct ofconn *, struct ofp_bundle *);
-enum ofperr ofconn_remove_bundle(struct ofconn *, struct ofp_bundle *);
+void ofconn_insert_bundle(struct ofconn *, struct ofp_bundle *);
+void ofconn_remove_bundle(struct ofconn *, struct ofp_bundle *);
 
 /* Logging flow_mod summaries. */
 void ofconn_report_flow_mod(struct ofconn *, enum ofp_flow_mod_command);
@@ -141,7 +125,9 @@ void ofconn_report_flow_mod(struct ofconn *, enum ofp_flow_mod_command);
 /* Sending asynchronous messages. */
 bool connmgr_wants_packet_in_on_miss(struct connmgr *mgr);
 void connmgr_send_port_status(struct connmgr *, struct ofconn *source,
-                              const struct ofputil_phy_port *, uint8_t reason);
+                              const struct ofputil_phy_port *old_pp,
+                              const struct ofputil_phy_port *new_pp,
+                              uint8_t reason);
 void connmgr_send_flow_removed(struct connmgr *,
                                const struct ofputil_flow_removed *)
     OVS_REQUIRES(ofproto_mutex);

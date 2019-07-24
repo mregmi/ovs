@@ -33,6 +33,7 @@
 #include "util.h"
 
 struct dpif_flow_stats;
+struct dpif_flow_attrs;
 struct ds;
 struct flow_wildcards;
 struct minimask;
@@ -72,6 +73,7 @@ void flow_extract(struct dp_packet *, struct flow *);
 void flow_zero_wildcards(struct flow *, const struct flow_wildcards *);
 void flow_unwildcard_tp_ports(const struct flow *, struct flow_wildcards *);
 void flow_get_metadata(const struct flow *, struct match *flow_metadata);
+struct netdev *flow_get_tunnel_netdev(struct flow_tnl *tunnel);
 
 const char *ct_state_to_string(uint32_t state);
 uint32_t ct_state_from_string(const char *);
@@ -98,10 +100,10 @@ static inline int flow_compare_3way(const struct flow *, const struct flow *);
 static inline bool flow_equal(const struct flow *, const struct flow *);
 static inline size_t flow_hash(const struct flow *, uint32_t basis);
 
-void flow_set_dl_vlan(struct flow *, ovs_be16 vid);
+void flow_set_dl_vlan(struct flow *, ovs_be16 vid, int id);
 void flow_fix_vlan_tpid(struct flow *);
 void flow_set_vlan_vid(struct flow *, ovs_be16 vid);
-void flow_set_vlan_pcp(struct flow *, uint8_t pcp);
+void flow_set_vlan_pcp(struct flow *, uint8_t pcp, int id);
 
 void flow_limit_vlans(int vlan_limit);
 int flow_count_vlan_headers(const struct flow *);
@@ -124,12 +126,16 @@ void flow_set_mpls_tc(struct flow *, int idx, uint8_t tc);
 void flow_set_mpls_bos(struct flow *, int idx, uint8_t stack);
 void flow_set_mpls_lse(struct flow *, int idx, ovs_be32 lse);
 
-bool flow_compose(struct dp_packet *, const struct flow *, size_t);
+void flow_compose(struct dp_packet *, const struct flow *,
+                  const void *l7, size_t l7_len);
+void packet_expand(struct dp_packet *, const struct flow *, size_t size);
 
 bool parse_ipv6_ext_hdrs(const void **datap, size_t *sizep, uint8_t *nw_proto,
-                         uint8_t *nw_frag);
+                         uint8_t *nw_frag,
+                         const struct ovs_16aligned_ip6_frag **frag_hdr);
 ovs_be16 parse_dl_type(const struct eth_header *data_, size_t size);
-bool parse_nsh(const void **datap, size_t *sizep, struct flow_nsh *key);
+bool parse_nsh(const void **datap, size_t *sizep, struct ovs_key_nsh *key);
+uint16_t parse_tcp_flags(struct dp_packet *packet);
 
 static inline uint64_t
 flow_get_xreg(const struct flow *flow, int idx)
@@ -234,8 +240,10 @@ hash_odp_port(odp_port_t odp_port)
 
 uint32_t flow_hash_5tuple(const struct flow *flow, uint32_t basis);
 uint32_t flow_hash_symmetric_l4(const struct flow *flow, uint32_t basis);
+uint32_t flow_hash_symmetric_l2(const struct flow *flow, uint32_t basis);
 uint32_t flow_hash_symmetric_l3l4(const struct flow *flow, uint32_t basis,
                          bool inc_udp_ports );
+uint32_t flow_hash_symmetric_l3(const struct flow *flow, uint32_t basis);
 
 /* Initialize a flow with random fields that matter for nx_hash_fields. */
 void flow_random_hash_fields(struct flow *);
@@ -682,6 +690,14 @@ miniflow_get__(const struct miniflow *mf, size_t idx)
 /* Get the value of the struct flow 'FIELD' as up to 8 byte wide integer type
  * 'TYPE' from miniflow 'MF'. */
 #define MINIFLOW_GET_TYPE(MF, TYPE, FIELD)                              \
+    (BUILD_ASSERT(sizeof(TYPE) == sizeof(((struct flow *)0)->FIELD)),   \
+     BUILD_ASSERT_GCCONLY(__builtin_types_compatible_p(TYPE, typeof(((struct flow *)0)->FIELD))), \
+     MINIFLOW_GET_TYPE__(MF, TYPE, FIELD))
+
+/* Like MINIFLOW_GET_TYPE, but without checking that TYPE is the correct width
+ * for FIELD.  (This is useful for deliberately reading adjacent fields in one
+ * go.)  */
+#define MINIFLOW_GET_TYPE__(MF, TYPE, FIELD)                            \
     (MINIFLOW_IN_MAP(MF, FLOW_U64_OFFSET(FIELD))                        \
      ? ((OVS_FORCE const TYPE *)miniflow_get__(MF, FLOW_U64_OFFSET(FIELD))) \
      [FLOW_U64_OFFREM(FIELD) / sizeof(TYPE)]                            \
@@ -718,6 +734,11 @@ static inline ovs_be32 miniflow_get_be32(const struct miniflow *,
 static inline uint16_t miniflow_get_vid(const struct miniflow *, size_t);
 static inline uint16_t miniflow_get_tcp_flags(const struct miniflow *);
 static inline ovs_be64 miniflow_get_metadata(const struct miniflow *);
+static inline uint64_t miniflow_get_tun_metadata_present_map(
+    const struct miniflow *);
+static inline uint32_t miniflow_get_recirc_id(const struct miniflow *);
+static inline uint32_t miniflow_get_dp_hash(const struct miniflow *);
+static inline ovs_be32 miniflow_get_ports(const struct miniflow *);
 
 bool miniflow_equal(const struct miniflow *a, const struct miniflow *b);
 bool miniflow_equal_in_minimask(const struct miniflow *a,
@@ -804,7 +825,7 @@ miniflow_get_vid(const struct miniflow *flow, size_t n)
 {
     if (n < FLOW_MAX_VLAN_HEADERS) {
         union flow_vlan_hdr hdr = {
-            .qtag = MINIFLOW_GET_BE32(flow, vlans[n])
+            .qtag = MINIFLOW_GET_BE32(flow, vlans[n].qtag)
         };
         return vlan_tci_to_vid(hdr.tci);
     }
@@ -845,6 +866,35 @@ static inline ovs_be64
 miniflow_get_metadata(const struct miniflow *flow)
 {
     return MINIFLOW_GET_BE64(flow, metadata);
+}
+
+/* Returns the bitmap that indicates which tunnel metadata fields are present
+ * in 'flow'. */
+static inline uint64_t
+miniflow_get_tun_metadata_present_map(const struct miniflow *flow)
+{
+    return MINIFLOW_GET_U64(flow, tunnel.metadata.present.map);
+}
+
+/* Returns the recirc_id in 'flow.' */
+static inline uint32_t
+miniflow_get_recirc_id(const struct miniflow *flow)
+{
+    return MINIFLOW_GET_U32(flow, recirc_id);
+}
+
+/* Returns the dp_hash in 'flow.' */
+static inline uint32_t
+miniflow_get_dp_hash(const struct miniflow *flow)
+{
+    return MINIFLOW_GET_U32(flow, dp_hash);
+}
+
+/* Returns the 'tp_src' and 'tp_dst' fields together as one piece of data. */
+static inline ovs_be32
+miniflow_get_ports(const struct miniflow *flow)
+{
+    return MINIFLOW_GET_TYPE__(flow, ovs_be32, tp_src);
 }
 
 /* Returns the mask for the OpenFlow 1.1+ "metadata" field in 'mask'.
@@ -915,7 +965,7 @@ static inline void
 pkt_metadata_from_flow(struct pkt_metadata *md, const struct flow *flow)
 {
     /* Update this function whenever struct flow changes. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 40);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 41);
 
     md->recirc_id = flow->recirc_id;
     md->dp_hash = flow->dp_hash;
@@ -929,7 +979,7 @@ pkt_metadata_from_flow(struct pkt_metadata *md, const struct flow *flow)
     md->ct_label = flow->ct_label;
 
     md->ct_orig_tuple_ipv6 = false;
-    if (is_ct_valid(flow, NULL, NULL)) {
+    if (flow->dl_type && is_ct_valid(flow, NULL, NULL)) {
         if (flow->dl_type == htons(ETH_TYPE_IP)) {
             md->ct_orig_tuple.ipv4 = (struct ovs_key_ct_tuple_ipv4) {
                 flow->ct_nw_src,
@@ -947,6 +997,9 @@ pkt_metadata_from_flow(struct pkt_metadata *md, const struct flow *flow)
                 flow->ct_tp_dst,
                 flow->ct_nw_proto,
             };
+        } else {
+            /* Reset ct_orig_tuple for other types. */
+            memset(&md->ct_orig_tuple, 0, sizeof md->ct_orig_tuple);
         }
     } else {
         memset(&md->ct_orig_tuple, 0, sizeof md->ct_orig_tuple);
@@ -1071,6 +1124,22 @@ static inline bool is_nd(const struct flow *flow,
     return false;
 }
 
+static inline bool is_arp(const struct flow *flow)
+{
+    return (flow->dl_type == htons(ETH_TYPE_ARP));
+}
+
+static inline bool is_garp(const struct flow *flow,
+                           struct flow_wildcards *wc)
+{
+    if (is_arp(flow)) {
+        return (FLOW_WC_GET_AND_MASK_WC(flow, wc, nw_src) ==
+                FLOW_WC_GET_AND_MASK_WC(flow, wc, nw_dst));
+    }
+
+    return false;
+}
+
 static inline bool is_igmp(const struct flow *flow, struct flow_wildcards *wc)
 {
     if (get_dl_type(flow) == htons(ETH_TYPE_IP)) {
@@ -1119,6 +1188,28 @@ static inline bool is_stp(const struct flow *flow)
 {
     return (flow->dl_type == htons(FLOW_DL_TYPE_NONE)
             && eth_addr_equals(flow->dl_dst, eth_addr_stp));
+}
+
+/* Returns true if flow->tp_dst equals 'port'.  If 'wc' is nonnull, sets
+ * appropriate bits in wc->masks.tp_dst to account for the test.
+ *
+ * The caller must already have ensured that 'flow' is a protocol for which
+ * tp_dst is relevant. */
+static inline bool tp_dst_equals(const struct flow *flow, uint16_t port,
+                                 struct flow_wildcards *wc)
+{
+    uint16_t diff = port ^ ntohs(flow->tp_dst);
+    if (wc) {
+        if (diff) {
+            /* Set mask for the most significant mismatching bit. */
+            int ofs = raw_clz64((uint64_t) diff << 48); /* range [0,15] */
+            wc->masks.tp_dst |= htons(0x8000 >> ofs);
+        } else {
+            /* Must match all bits. */
+            wc->masks.tp_dst = OVS_BE16_MAX;
+        }
+    }
+    return !diff;
 }
 
 #endif /* flow.h */

@@ -38,11 +38,10 @@
 #include "openvswitch/list.h"
 #include "openvswitch/match.h"
 #include "openvswitch/ofp-actions.h"
-#include "openvswitch/ofp-util.h"
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
 #include "openvswitch/shash.h"
 #include "timeval.h"
@@ -88,13 +87,13 @@ struct bond_slave {
 
     struct netdev *netdev;      /* Network device, owned by the client. */
     uint64_t change_seq;        /* Tracks changes in 'netdev'. */
-    ofp_port_t  ofp_port;       /* OpenFlow port number. */
     char *name;                 /* Name (a copy of netdev_get_name(netdev)). */
+    ofp_port_t  ofp_port;       /* OpenFlow port number. */
 
     /* Link status. */
-    long long delay_expires;    /* Time after which 'enabled' may change. */
     bool enabled;               /* May be chosen for flows? */
     bool may_enable;            /* Client considers this slave bondable. */
+    long long delay_expires;    /* Time after which 'enabled' may change. */
 
     /* Rebalancing info.  Used only by bond_rebalance(). */
     struct ovs_list bal_node;   /* In bond_rebalance()'s 'bals' list. */
@@ -187,6 +186,7 @@ static struct bond_slave *choose_output_slave(const struct bond *,
                                               uint16_t vlan)
     OVS_REQ_RDLOCK(rwlock);
 static void update_recirc_rules__(struct bond *bond);
+static bool bond_is_falling_back_to_ab(const struct bond *);
 
 /* Attempts to parse 's' as the name of a bond balancing mode.  If successful,
  * stores the mode in '*balance' and returns true.  Otherwise returns false
@@ -389,7 +389,9 @@ update_recirc_rules__(struct bond *bond)
             }
 
             hmap_remove(&bond->pr_rule_ops, &pr_op->hmap_node);
-            *pr_op->pr_rule = NULL;
+            if (bond->hash) {
+                *pr_op->pr_rule = NULL;
+            }
             free(pr_op);
             break;
         }
@@ -647,6 +649,13 @@ bond_run(struct bond *bond, enum lacp_status lacp_status)
     if (bond->lacp_status != lacp_status) {
         bond->lacp_status = lacp_status;
         bond->bond_revalidate = true;
+
+        /* Change in LACP status can affect whether the bond is falling back to
+         * active-backup.  Make sure to create or destroy buckets if
+         * necessary.  */
+        if (bond_is_falling_back_to_ab(bond) || !bond->hash) {
+            bond_entry_reset(bond);
+        }
     }
 
     /* Enable slaves based on link status and LACP feedback. */
@@ -755,6 +764,15 @@ bond_compose_learning_packet(struct bond *bond, const struct eth_addr eth_src,
     return packet;
 }
 
+
+static bool
+bond_is_falling_back_to_ab(const struct bond *bond)
+{
+    return (bond->lacp_fallback_ab
+            && (bond->balance == BM_SLB || bond->balance == BM_TCP)
+            && bond->lacp_status == LACP_CONFIGURED);
+}
+
 /* Checks whether a packet that arrived on 'slave_' within 'bond', with an
  * Ethernet destination address of 'eth_dst', should be admitted.
  *
@@ -776,6 +794,7 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
 {
     enum bond_verdict verdict = BV_DROP;
     struct bond_slave *slave;
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
     ovs_rwlock_rdlock(&rwlock);
     slave = bond_slave_lookup(bond, slave_);
@@ -793,7 +812,11 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
      * drop all incoming traffic except if lacp_fallback_ab is enabled. */
     switch (bond->lacp_status) {
     case LACP_NEGOTIATED:
-        verdict = slave->enabled ? BV_ACCEPT : BV_DROP;
+        /* To reduce packet-drops due to delay in enabling of slave (post
+         * LACP-SYNC), from main thread, check for may_enable as well.
+         * When may_enable is TRUE, it means LACP is UP and waiting for the
+         * main thread to run LACP state machine and enable the slave. */
+        verdict = (slave->enabled || slave->may_enable) ? BV_ACCEPT : BV_DROP;
         goto out;
     case LACP_CONFIGURED:
         if (!bond->lacp_fallback_ab) {
@@ -829,8 +852,6 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
         /* Drop all packets which arrive on backup slaves.  This is similar to
          * how Linux bonding handles active-backup bonds. */
         if (bond->active_slave != slave) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-
             VLOG_DBG_RL(&rl, "active-backup bond received packet on backup"
                         " slave (%s) destined for " ETH_ADDR_FMT,
                         slave->name, ETH_ADDR_ARGS(eth_dst));
@@ -852,6 +873,19 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
 
     OVS_NOT_REACHED();
 out:
+    if (slave && (verdict != BV_ACCEPT)) {
+        VLOG_DBG_RL(&rl, "slave (%s): Admissibility verdict is to drop pkt %s."
+                    "active slave: %s, may_enable: %s enable: %s "
+                    "LACP status:%d",
+                    slave->name,
+                    (verdict == BV_DROP_IF_MOVED) ?
+                        "as different port is learned" : "",
+                    (bond->active_slave == slave) ? "true" : "false",
+                    slave->may_enable ? "true" : "false",
+                    slave->enabled ? "true" : "false",
+                    bond->lacp_status);
+    }
+
     ovs_rwlock_unlock(&rwlock);
     return verdict;
 
@@ -926,7 +960,8 @@ bond_recirculation_account(struct bond *bond)
 static bool
 bond_may_recirc(const struct bond *bond)
 {
-    return bond->balance == BM_TCP && bond->recirc_id;
+    return (bond->balance == BM_TCP && bond->recirc_id
+            && !bond_is_falling_back_to_ab(bond));
 }
 
 static void
@@ -985,7 +1020,8 @@ static bool
 bond_is_balanced(const struct bond *bond) OVS_REQ_RDLOCK(rwlock)
 {
     return bond->rebalance_interval
-        && (bond->balance == BM_SLB || bond->balance == BM_TCP);
+        && (bond->balance == BM_SLB || bond->balance == BM_TCP)
+        && !(bond->lacp_fallback_ab && bond->lacp_status == LACP_CONFIGURED);
 }
 
 /* Notifies 'bond' that 'n_bytes' bytes were sent in 'flow' within 'vlan'. */
@@ -1373,15 +1409,15 @@ bond_print_details(struct ds *ds, const struct bond *bond)
         ds_put_format(ds, "\nslave %s: %s\n",
                       slave->name, slave->enabled ? "enabled" : "disabled");
         if (slave == bond->active_slave) {
-            ds_put_cstr(ds, "\tactive slave\n");
+            ds_put_cstr(ds, "  active slave\n");
         }
         if (slave->delay_expires != LLONG_MAX) {
-            ds_put_format(ds, "\t%s expires in %lld ms\n",
+            ds_put_format(ds, "  %s expires in %lld ms\n",
                           slave->enabled ? "downdelay" : "updelay",
                           slave->delay_expires - time_msec());
         }
 
-        ds_put_format(ds, "\tmay_enable: %s\n",
+        ds_put_format(ds, "  may_enable: %s\n",
                       slave->may_enable ? "true" : "false");
 
         if (!bond_is_balanced(bond)) {
@@ -1399,7 +1435,7 @@ bond_print_details(struct ds *ds, const struct bond *bond)
 
             be_tx_k = be->tx_bytes / 1024;
             if (be_tx_k) {
-                ds_put_format(ds, "\thash %d: %"PRIu64" kB load\n",
+                ds_put_format(ds, "  hash %d: %"PRIu64" kB load\n",
                           hash, be_tx_k);
             }
 
@@ -1644,7 +1680,7 @@ bond_init(void)
 static void
 bond_entry_reset(struct bond *bond)
 {
-    if (bond->balance != BM_AB) {
+    if (bond->balance != BM_AB && !bond_is_falling_back_to_ab(bond)) {
         size_t hash_len = BOND_BUCKETS * sizeof *bond->hash;
 
         if (!bond->hash) {
@@ -1679,6 +1715,8 @@ bond_slave_lookup(struct bond *bond, const void *slave_)
 static void
 bond_enable_slave(struct bond_slave *slave, bool enable)
 {
+    struct bond *bond = slave->bond;
+
     slave->delay_expires = LLONG_MAX;
     if (enable != slave->enabled) {
         slave->bond->bond_revalidate = true;
@@ -1688,6 +1726,7 @@ bond_enable_slave(struct bond_slave *slave, bool enable)
         if (enable) {
             ovs_list_insert(&slave->bond->enabled_slaves, &slave->list_node);
         } else {
+            bond->send_learning_packets = true;
             ovs_list_remove(&slave->list_node);
         }
         ovs_mutex_unlock(&slave->bond->mutex);
@@ -1713,8 +1752,7 @@ bond_link_status_update(struct bond_slave *slave)
             VLOG_INFO_RL(&rl, "interface %s: will not be %s",
                          slave->name, up ? "disabled" : "enabled");
         } else {
-            int delay = (bond->lacp_status != LACP_DISABLED ? 0
-                         : up ? bond->updelay : bond->downdelay);
+            int delay = up ? bond->updelay : bond->downdelay;
             slave->delay_expires = time_msec() + delay;
             if (delay) {
                 VLOG_INFO_RL(&rl, "interface %s: will be %s if it stays %s "

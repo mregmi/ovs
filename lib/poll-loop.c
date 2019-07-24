@@ -15,7 +15,7 @@
  */
 
 #include <config.h>
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -415,6 +415,7 @@ poll_loop(void)
     loop = pthread_getspecific(key);
     if (!loop) {
         loop = xzalloc(sizeof *loop);
+        loop->timeout_when = LLONG_MAX;
         hmap_init(&loop->poll_nodes);
         xpthread_setspecific(key, loop);
     }

@@ -37,6 +37,7 @@ OVS
    :maxdepth: 2
 
    kvm
+   ipsec
    selinux
    libvirt
    ssl
@@ -57,3 +58,4 @@ OVN
 
    docker
    openstack-containers
+   firewalld

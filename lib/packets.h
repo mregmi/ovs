@@ -32,6 +32,7 @@
 #include "tun-metadata.h"
 #include "unaligned.h"
 #include "util.h"
+#include "timeval.h"
 
 struct dp_packet;
 struct ds;
@@ -159,13 +160,18 @@ pkt_metadata_init(struct pkt_metadata *md, odp_port_t port)
 }
 
 /* This function prefetches the cachelines touched by pkt_metadata_init()
- * For performance reasons the two functions should be kept in sync. */
+ * and pkt_metadata_init_tnl().  For performance reasons the two functions
+ * should be kept in sync. */
 static inline void
 pkt_metadata_prefetch_init(struct pkt_metadata *md)
 {
     /* Prefetch cacheline0 as members till ct_state and odp_port will
      * be initialized later in pkt_metadata_init(). */
     OVS_PREFETCH(md->cacheline0);
+
+    /* Prefetch cacheline1 as members of this cacheline will be zeroed out
+     * in pkt_metadata_init_tnl(). */
+    OVS_PREFETCH(md->cacheline1);
 
     /* Prefetch cachline2 as ip_dst & ipv6_dst fields will be initialized. */
     OVS_PREFETCH(md->cacheline2);
@@ -176,24 +182,24 @@ bool dpid_from_string(const char *s, uint64_t *dpidp);
 #define ETH_ADDR_LEN           6
 
 static const struct eth_addr eth_addr_broadcast OVS_UNUSED
-    = { { { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } } };
+    = ETH_ADDR_C(ff,ff,ff,ff,ff,ff);
 
 static const struct eth_addr eth_addr_exact OVS_UNUSED
-    = { { { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } } };
+    = ETH_ADDR_C(ff,ff,ff,ff,ff,ff);
 
 static const struct eth_addr eth_addr_zero OVS_UNUSED
-    = { { { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } } };
+    = ETH_ADDR_C(00,00,00,00,00,00);
 static const struct eth_addr64 eth_addr64_zero OVS_UNUSED
-    = { { { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } } };
+    = ETH_ADDR64_C(00,00,00,00,00,00,00,00);
 
 static const struct eth_addr eth_addr_stp OVS_UNUSED
-    = { { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x00 } } };
+    = ETH_ADDR_C(01,80,c2,00,00,00);
 
 static const struct eth_addr eth_addr_lacp OVS_UNUSED
-    = { { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x02 } } };
+    = ETH_ADDR_C(01,80,c2,00,00,02);
 
 static const struct eth_addr eth_addr_bfd OVS_UNUSED
-    = { { { 0x00, 0x23, 0x20, 0x00, 0x00, 0x01 } } };
+    = ETH_ADDR_C(00,23,20,00,00,01);
 
 static inline bool eth_addr_is_broadcast(const struct eth_addr a)
 {
@@ -399,6 +405,8 @@ ovs_be32 set_mpls_lse_values(uint8_t ttl, uint8_t tc, uint8_t bos,
 #define ETH_TYPE_MPLS          0x8847
 #define ETH_TYPE_MPLS_MCAST    0x8848
 #define ETH_TYPE_NSH           0x894f
+#define ETH_TYPE_ERSPAN1       0x88be   /* version 1 type II */
+#define ETH_TYPE_ERSPAN2       0x22eb   /* version 2 type III */
 
 static inline bool eth_type_mpls(ovs_be16 eth_type)
 {
@@ -434,9 +442,8 @@ void push_eth(struct dp_packet *packet, const struct eth_addr *dst,
               const struct eth_addr *src);
 void pop_eth(struct dp_packet *packet);
 
-void encap_nsh(struct dp_packet *packet,
-               const struct ovs_action_encap_nsh *encap_nsh);
-bool decap_nsh(struct dp_packet *packet);
+void push_nsh(struct dp_packet *packet, const struct nsh_hdr *nsh_hdr_src);
+bool pop_nsh(struct dp_packet *packet);
 
 #define LLC_DSAP_SNAP 0xaa
 #define LLC_SSAP_SNAP 0xaa
@@ -674,6 +681,7 @@ char *ip_parse_cidr_len(const char *s, int *n, ovs_be32 *ip,
 #define IP_ECN_ECT_0 0x02
 #define IP_ECN_CE 0x03
 #define IP_ECN_MASK 0x03
+#define IP_DSCP_CS6 0xc0
 #define IP_DSCP_MASK 0xfc
 
 static inline int
@@ -756,6 +764,20 @@ struct igmpv3_header {
 };
 BUILD_ASSERT_DECL(IGMPV3_HEADER_LEN == sizeof(struct igmpv3_header));
 
+#define IGMPV3_QUERY_HEADER_LEN 12
+struct igmpv3_query_header {
+    uint8_t type;
+    uint8_t max_resp;
+    ovs_be16 csum;
+    ovs_16aligned_be32 group;
+    uint8_t srs_qrv;
+    uint8_t qqic;
+    ovs_be16 nsrcs;
+};
+BUILD_ASSERT_DECL(
+    IGMPV3_QUERY_HEADER_LEN == sizeof(struct igmpv3_query_header
+));
+
 #define IGMPV3_RECORD_LEN 8
 struct igmpv3_record {
     uint8_t type;
@@ -798,6 +820,20 @@ struct udp_header {
     ovs_be16 udp_csum;
 };
 BUILD_ASSERT_DECL(UDP_HEADER_LEN == sizeof(struct udp_header));
+
+#define ESP_HEADER_LEN 8
+struct esp_header {
+    ovs_be32 spi;
+    ovs_be32 seq_no;
+};
+BUILD_ASSERT_DECL(ESP_HEADER_LEN == sizeof(struct esp_header));
+
+#define ESP_TRAILER_LEN 2
+struct esp_trailer {
+    uint8_t pad_len;
+    uint8_t next_hdr;
+};
+BUILD_ASSERT_DECL(ESP_TRAILER_LEN == sizeof(struct esp_trailer));
 
 #define TCP_FIN 0x001
 #define TCP_SYN 0x002
@@ -930,7 +966,7 @@ struct icmp6_error_header {
 BUILD_ASSERT_DECL(ICMP6_ERROR_HEADER_LEN == sizeof(struct icmp6_error_header));
 
 uint32_t packet_csum_pseudoheader6(const struct ovs_16aligned_ip6_hdr *);
-uint16_t packet_csum_upperlayer6(const struct ovs_16aligned_ip6_hdr *,
+ovs_be16 packet_csum_upperlayer6(const struct ovs_16aligned_ip6_hdr *,
                                  const void *, uint8_t, uint16_t);
 
 /* Neighbor Discovery option field.
@@ -957,11 +993,9 @@ struct ovs_nd_prefix_opt {
 };
 BUILD_ASSERT_DECL(ND_PREFIX_OPT_LEN == sizeof(struct ovs_nd_prefix_opt));
 
-#define ND_PREFIX_ON_LINK            0x80
-#define ND_PREFIX_AUTONOMOUS_ADDRESS 0x40
-
 /* Neighbor Discovery option: MTU. */
 #define ND_MTU_OPT_LEN 8
+#define ND_MTU_DEFAULT 0
 struct ovs_nd_mtu_opt {
     uint8_t  type;      /* ND_OPT_MTU */
     uint8_t  len;       /* Always 1. */
@@ -1000,6 +1034,17 @@ BUILD_ASSERT_DECL(RA_MSG_LEN == sizeof(struct ovs_ra_msg));
 
 #define ND_RA_MANAGED_ADDRESS 0x80
 #define ND_RA_OTHER_CONFIG    0x40
+
+/* Defaults based on MaxRtrInterval and MinRtrInterval from RFC 4861 section
+ * 6.2.1
+ */
+#define ND_RA_MAX_INTERVAL_DEFAULT 600
+
+static inline int
+nd_ra_min_interval_default(int max)
+{
+    return max >= 9 ? max / 3 : max * 3 / 4;
+}
 
 /*
  * Use the same struct for MLD and MLD2, naming members as the defined fields in
@@ -1093,7 +1138,9 @@ static inline bool ipv6_addr_is_multicast(const struct in6_addr *ip) {
 static inline struct in6_addr
 in6_addr_mapped_ipv4(ovs_be32 ip4)
 {
-    struct in6_addr ip6 = { .s6_addr = { [10] = 0xff, [11] = 0xff } };
+    struct in6_addr ip6;
+    memset(&ip6, 0, sizeof(ip6));
+    ip6.s6_addr[10] = 0xff, ip6.s6_addr[11] = 0xff;
     memcpy(&ip6.s6_addr[12], &ip4, 4);
     return ip6;
 }
@@ -1107,7 +1154,8 @@ in6_addr_set_mapped_ipv4(struct in6_addr *ip6, ovs_be32 ip4)
 static inline ovs_be32
 in6_addr_get_mapped_ipv4(const struct in6_addr *addr)
 {
-    union ovs_16aligned_in6_addr *taddr = (void *) addr;
+    union ovs_16aligned_in6_addr *taddr =
+        (union ovs_16aligned_in6_addr *) addr;
     if (IN6_IS_ADDR_V4MAPPED(addr)) {
         return get_16aligned_be32(&taddr->be32[3]);
     } else {
@@ -1118,7 +1166,8 @@ in6_addr_get_mapped_ipv4(const struct in6_addr *addr)
 static inline void
 in6_addr_solicited_node(struct in6_addr *addr, const struct in6_addr *ip6)
 {
-    union ovs_16aligned_in6_addr *taddr = (void *) addr;
+    union ovs_16aligned_in6_addr *taddr =
+        (union ovs_16aligned_in6_addr *) addr;
     memset(taddr->be16, 0, sizeof(taddr->be16));
     taddr->be16[0] = htons(0xff02);
     taddr->be16[5] = htons(0x1);
@@ -1134,8 +1183,10 @@ static inline void
 in6_generate_eui64(struct eth_addr ea, struct in6_addr *prefix,
                    struct in6_addr *lla)
 {
-    union ovs_16aligned_in6_addr *taddr = (void *) lla;
-    union ovs_16aligned_in6_addr *prefix_taddr = (void *) prefix;
+    union ovs_16aligned_in6_addr *taddr =
+        (union ovs_16aligned_in6_addr *) lla;
+    union ovs_16aligned_in6_addr *prefix_taddr =
+        (union ovs_16aligned_in6_addr *) prefix;
     taddr->be16[0] = prefix_taddr->be16[0];
     taddr->be16[1] = prefix_taddr->be16[1];
     taddr->be16[2] = prefix_taddr->be16[2];
@@ -1153,7 +1204,8 @@ in6_generate_eui64(struct eth_addr ea, struct in6_addr *prefix,
 static inline void
 in6_generate_lla(struct eth_addr ea, struct in6_addr *lla)
 {
-    union ovs_16aligned_in6_addr *taddr = (void *) lla;
+    union ovs_16aligned_in6_addr *taddr =
+        (union ovs_16aligned_in6_addr *) lla;
     memset(taddr->be16, 0, sizeof(taddr->be16));
     taddr->be16[0] = htons(0xfe80);
     taddr->be16[4] = htons(((ea.ea[0] ^ 0x02) << 8) | ea.ea[1]);
@@ -1208,6 +1260,150 @@ struct gre_base_hdr {
 #define GRE_REC         0x0700
 #define GRE_FLAGS       0x00F8
 #define GRE_VERSION     0x0007
+
+/*
+ * ERSPAN protocol header and metadata
+ *
+ * Version 1 (Type II) header (8 octets [42:49])
+ *  0                   1                   2                   3
+ *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |  Ver  |          VLAN         | COS | En|T|    Session ID     |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |      Reserved         |                  Index                |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *
+ *
+ *  ERSPAN Version 2 (Type III) header (12 octets [42:49])
+ *  0                   1                   2                   3
+ *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |  Ver  |          VLAN         | COS |BSO|T|     Session ID    |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                          Timestamp                            |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |             SGT               |P|    FT   |   Hw ID   |D|Gra|O|
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *
+ */
+
+/* ERSPAN has fixed 8-byte GRE header */
+#define ERSPAN_GREHDR_LEN   8
+#define ERSPAN_HDR(gre_base_hdr) \
+    ((struct erspan_base_hdr *)((char *)gre_base_hdr + ERSPAN_GREHDR_LEN))
+
+#define ERSPAN_V1_MDSIZE    4
+#define ERSPAN_V2_MDSIZE    8
+
+#define ERSPAN_SID_MASK     0x03ff  /* 10-bit Session ID. */
+#define ERSPAN_IDX_MASK     0xfffff /* v1 Index */
+#define ERSPAN_HWID_MASK    0x03f0
+#define ERSPAN_DIR_MASK     0x0008
+
+struct erspan_base_hdr {
+#ifdef WORDS_BIGENDIAN
+    uint8_t ver:4,
+            vlan_upper:4;
+    uint8_t vlan:8;
+    uint8_t cos:3,
+            en:2,
+            t:1,
+            session_id_upper:2;
+    uint8_t session_id:8;
+#else
+    uint8_t vlan_upper:4,
+            ver:4;
+    uint8_t vlan:8;
+    uint8_t session_id_upper:2,
+            t:1,
+            en:2,
+            cos:3;
+    uint8_t session_id:8;
+#endif
+};
+
+struct erspan_md2 {
+    ovs_16aligned_be32 timestamp;
+    ovs_be16 sgt;
+#ifdef WORDS_BIGENDIAN
+    uint8_t p:1,
+            ft:5,
+            hwid_upper:2;
+    uint8_t hwid:4,
+            dir:1,
+            gra:2,
+            o:1;
+#else
+    uint8_t hwid_upper:2,
+            ft:5,
+            p:1;
+    uint8_t o:1,
+            gra:2,
+            dir:1,
+            hwid:4;
+#endif
+};
+
+struct erspan_metadata {
+    int version;
+    union {
+        ovs_be32 index;         /* Version 1 (type II)*/
+        struct erspan_md2 md2;  /* Version 2 (type III) */
+    } u;
+};
+
+static inline uint16_t get_sid(const struct erspan_base_hdr *ershdr)
+{
+    return (ershdr->session_id_upper << 8) + ershdr->session_id;
+}
+
+static inline void set_sid(struct erspan_base_hdr *ershdr, uint16_t id)
+{
+    ershdr->session_id = id & 0xff;
+    ershdr->session_id_upper = (id >> 8) &0x3;
+}
+
+static inline uint8_t get_hwid(const struct erspan_md2 *md2)
+{
+    return (md2->hwid_upper << 4) + md2->hwid;
+}
+
+static inline void set_hwid(struct erspan_md2 *md2, uint8_t hwid)
+{
+    md2->hwid = hwid & 0xf;
+    md2->hwid_upper = (hwid >> 4) & 0x3;
+}
+
+/* ERSPAN timestamp granularity
+ *   00b --> granularity = 100 microseconds
+ *   01b --> granularity = 100 nanoseconds
+ *   10b --> granularity = IEEE 1588
+ * Here we only support 100 microseconds.
+ */
+enum erspan_ts_gra {
+    ERSPAN_100US,
+    ERSPAN_100NS,
+    ERSPAN_IEEE1588,
+};
+
+static inline ovs_be32 get_erspan_ts(enum erspan_ts_gra gra)
+{
+    ovs_be32 ts = 0;
+
+    switch (gra) {
+    case ERSPAN_100US:
+        ts = htonl((uint32_t)(time_wall_usec() / 100));
+        break;
+    case ERSPAN_100NS:
+        /* fall back */
+    case ERSPAN_IEEE1588:
+        /* fall back */
+    default:
+        OVS_NOT_REACHED();
+        break;
+    }
+    return ts;
+}
 
 /* VXLAN protocol header */
 struct vxlanhdr {
@@ -1359,7 +1555,12 @@ void packet_set_sctp_port(struct dp_packet *, ovs_be16 src, ovs_be16 dst);
 void packet_set_icmp(struct dp_packet *, uint8_t type, uint8_t code);
 void packet_set_nd(struct dp_packet *, const struct in6_addr *target,
                    const struct eth_addr sll, const struct eth_addr tll);
-
+void packet_set_nd_ext(struct dp_packet *packet,
+                       const ovs_16aligned_be32 rso_flags,
+                       const uint8_t opt_type);
+void packet_set_igmp3_query(struct dp_packet *, uint8_t max_resp,
+                            ovs_be32 group, bool srs, uint8_t qrv,
+                            uint8_t qqic);
 void packet_format_tcp_flags(struct ds *, uint16_t);
 const char *packet_tcp_flag_to_string(uint32_t flag);
 void compose_arp__(struct dp_packet *);
@@ -1382,7 +1583,7 @@ void compose_nd_ra(struct dp_packet *,
                    const struct in6_addr *ipv6_dst,
                    uint8_t cur_hop_limit, uint8_t mo_flags,
                    ovs_be16 router_lt, ovs_be32 reachable_time,
-                   ovs_be32 retrans_timer, ovs_be32 mtu);
+                   ovs_be32 retrans_timer, uint32_t mtu);
 void packet_put_ra_prefix_opt(struct dp_packet *,
                               uint8_t plen, uint8_t la_flags,
                               ovs_be32 valid_lifetime,

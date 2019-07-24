@@ -22,9 +22,6 @@ struct net;
 #define IFF_LIVE_ADDR_CHANGE 0
 #endif
 
-#ifndef IFF_NO_QUEUE
-#define IFF_NO_QUEUE	0
-#endif
 #ifndef IFF_OPENVSWITCH
 #define IFF_OPENVSWITCH 0
 #endif
@@ -38,11 +35,6 @@ struct net;
 #define NET_NAME_UNKNOWN 0
 #define alloc_netdev(sizeof_priv, name, name_assign_type, setup) \
         alloc_netdev_mq(sizeof_priv, name, setup, 1)
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,33)
-#define unregister_netdevice_queue(dev, head)	unregister_netdevice(dev)
-#define unregister_netdevice_many(head)
 #endif
 
 #ifndef HAVE_DEV_DISABLE_LRO
@@ -104,14 +96,37 @@ static inline bool netif_needs_gso(struct sk_buff *skb,
 #ifndef HAVE_NETDEV_MASTER_UPPER_DEV_LINK_RH
 static inline int rpl_netdev_master_upper_dev_link(struct net_device *dev,
 					       struct net_device *upper_dev,
-					       void *upper_priv, void *upper_info)
+					       void *upper_priv,
+					       void *upper_info, void *extack)
 {
 	return netdev_master_upper_dev_link(dev, upper_dev);
 }
 #define netdev_master_upper_dev_link rpl_netdev_master_upper_dev_link
-
-#endif
-#endif
+#else /* #ifndef HAVE_NETDEV_MASTER_UPPER_DEV_LINK_RH */
+static inline int rpl_netdev_master_upper_dev_link(struct net_device *dev,
+					       struct net_device *upper_dev,
+					       void *upper_priv,
+					       void *upper_info, void *extack)
+{
+	return netdev_master_upper_dev_link(dev, upper_dev,
+					    upper_priv, upper_info);
+}
+#undef netdev_master_upper_dev_link
+#define netdev_master_upper_dev_link rpl_netdev_master_upper_dev_link
+#endif /* #else HAVE_NETDEV_MASTER_UPPER_DEV_LINK_RH */
+#else  /* #ifndef HAVE_NETDEV_MASTER_UPPER_DEV_LINK_PRIV */
+#ifndef HAVE_UPPER_DEV_LINK_EXTACK
+static inline int rpl_netdev_master_upper_dev_link(struct net_device *dev,
+					       struct net_device *upper_dev,
+					       void *upper_priv,
+					       void *upper_info, void *extack)
+{
+	return netdev_master_upper_dev_link(dev, upper_dev, upper_priv,
+					    upper_info);
+}
+#define netdev_master_upper_dev_link rpl_netdev_master_upper_dev_link
+#endif /* #ifndef HAVE_UPPER_DEV_LINK_EXTACK */
+#endif /* #else HAVE_NETDEV_MASTER_UPPER_DEV_LINK_PRIV */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,16,0)
 #define dev_queue_xmit rpl_dev_queue_xmit
@@ -285,6 +300,37 @@ static inline int skb_csum_hwoffload_help(struct sk_buff *skb,
 	 */
 	return skb_checksum_help(skb);
 }
+#endif
+
+#ifndef HAVE_SKB_GSO_ERROR_UNWIND
+static inline void skb_gso_error_unwind(struct sk_buff *skb, __be16 protocol,
+					int pulled_hlen, u16 mac_offset,
+					int mac_len)
+{
+	skb->protocol = protocol;
+	skb->encapsulation = 1;
+	skb_push(skb, pulled_hlen);
+	skb_reset_transport_header(skb);
+	skb->mac_header = mac_offset;
+	skb->network_header = skb->mac_header + mac_len;
+	skb->mac_len = mac_len;
+}
+#endif
+
+#ifndef HAVE_NETIF_KEEP_DST
+static inline void netif_keep_dst(struct net_device *dev)
+{
+}
+#endif
+
+#ifndef HAVE_DEV_CHANGE_FLAGS_TAKES_EXTACK
+static inline int rpl_dev_change_flags(struct net_device *dev,
+				       unsigned int flags,
+				       struct netlink_ext_ack *extack)
+{
+	return dev_change_flags(dev, flags);
+}
+#define dev_change_flags rpl_dev_change_flags
 #endif
 
 #endif /* __LINUX_NETDEVICE_WRAPPER_H */

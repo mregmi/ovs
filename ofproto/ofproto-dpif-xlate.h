@@ -26,6 +26,7 @@
 #include "ofproto.h"
 #include "stp.h"
 #include "ovs-lldp.h"
+#include "uuid.h"
 
 struct bfd;
 struct bond;
@@ -162,6 +163,9 @@ struct xlate_in {
     /* ofproto/trace maintains this queue to trace flows that require
      * recirculation. */
     struct ovs_list *recirc_queue;
+
+    /* UUID of first non-patch port packet was received on.*/
+    struct uuid xport_uuid;
 };
 
 void xlate_ofproto_set(struct ofproto_dpif *, const char *name, struct dpif *,
@@ -177,7 +181,7 @@ void xlate_bundle_set(struct ofproto_dpif *, struct ofbundle *,
                       const char *name, enum port_vlan_mode,
                       uint16_t qinq_ethtype, int vlan,
                       unsigned long *trunks, unsigned long *cvlans,
-                      bool use_priority_tags,
+                      enum port_priority_tags_mode,
                       const struct bond *, const struct lacp *,
                       bool floodable, bool protected);
 void xlate_bundle_remove(struct ofbundle *);
@@ -195,7 +199,8 @@ void xlate_ofport_remove(struct ofport_dpif *);
 
 struct ofproto_dpif * xlate_lookup_ofproto(const struct dpif_backer *,
                                            const struct flow *,
-                                           ofp_port_t *ofp_in_port);
+                                           ofp_port_t *ofp_in_port,
+                                           char **errorp);
 int xlate_lookup(const struct dpif_backer *, const struct flow *,
                  struct ofproto_dpif **, struct dpif_ipfix **,
                  struct dpif_sflow **, struct netflow **,
@@ -211,6 +216,7 @@ enum xlate_error {
     XLATE_RECIRCULATION_CONFLICT,
     XLATE_TOO_MANY_MPLS_LABELS,
     XLATE_INVALID_TUNNEL_METADATA,
+    XLATE_UNSUPPORTED_PACKET_TYPE,
 };
 
 const char *xlate_strerror(enum xlate_error error);
@@ -225,8 +231,8 @@ void xlate_out_uninit(struct xlate_out *);
 
 enum ofperr xlate_resume(struct ofproto_dpif *,
                          const struct ofputil_packet_in_private *,
-                         struct ofpbuf *odp_actions, enum slow_path_reason *);
-
+                         struct ofpbuf *odp_actions, enum slow_path_reason *,
+                         struct flow *, struct xlate_cache *);
 int xlate_send_packet(const struct ofport_dpif *, bool oam, struct dp_packet *);
 
 void xlate_mac_learning_update(const struct ofproto_dpif *ofproto,

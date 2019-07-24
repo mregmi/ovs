@@ -17,6 +17,8 @@
 #ifndef UTIL_H
 #define UTIL_H 1
 
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -27,11 +29,14 @@
 #include "compiler.h"
 #include "util.h"
 #include "openvswitch/util.h"
+#if defined(__aarch64__) && __GNUC__ >= 6
+#include <arm_neon.h>
+#endif
 
 extern char *program_name;
 
 #define __ARRAY_SIZE_NOCHECK(ARRAY) (sizeof(ARRAY) / sizeof((ARRAY)[0]))
-#ifdef __GNUC__
+#if __GNUC__ && !defined(__cplusplus)
 /* return 0 for array types, 1 otherwise */
 #define __ARRAY_CHECK(ARRAY) 					\
     !__builtin_types_compatible_p(typeof(ARRAY), typeof(&ARRAY[0]))
@@ -41,6 +46,19 @@ extern char *program_name;
 #define __ARRAY_SIZE(ARRAY)					\
     __builtin_choose_expr(__ARRAY_CHECK(ARRAY),			\
         __ARRAY_SIZE_NOCHECK(ARRAY), __ARRAY_FAIL(ARRAY))
+#elif defined(__cplusplus)
+#define __ARRAY_SIZE(ARRAY) ( \
+   0 * sizeof(reinterpret_cast<const ::Bad_arg_to_ARRAY_SIZE *>(ARRAY)) + \
+   0 * sizeof(::Bad_arg_to_ARRAY_SIZE::check_type((ARRAY), &(ARRAY))) + \
+   sizeof(ARRAY) / sizeof((ARRAY)[0]) )
+
+struct Bad_arg_to_ARRAY_SIZE {
+   class Is_pointer;
+   class Is_array {};
+   template <typename T>
+   static Is_pointer check_type(const T *, const T * const *);
+   static Is_array check_type(const void *, const void *);
+};
 #else
 #define __ARRAY_SIZE(ARRAY) __ARRAY_SIZE_NOCHECK(ARRAY)
 #endif
@@ -121,7 +139,12 @@ const char *get_subprogram_name(void);
 unsigned int get_page_size(void);
 long long int get_boot_time(void);
 
+void ctl_timeout_setup(unsigned int secs);
+
 void ovs_print_version(uint8_t min_ofp, uint8_t max_ofp);
+
+void set_memory_locked(void);
+bool memory_locked(void);
 
 OVS_NO_RETURN void out_of_memory(void);
 void *xmalloc(size_t) MALLOC_LIKE;
@@ -143,6 +166,13 @@ void free_cacheline(void *);
 
 void ovs_strlcpy(char *dst, const char *src, size_t size);
 void ovs_strzcpy(char *dst, const char *src, size_t size);
+
+int string_ends_with(const char *str, const char *suffix);
+
+void *xmalloc_pagealign(size_t) MALLOC_LIKE;
+void free_pagealign(void *);
+void *xmalloc_size_align(size_t, size_t) MALLOC_LIKE;
+void free_size_align(void *);
 
 /* The C standards say that neither the 'dst' nor 'src' argument to
  * memcpy() may be null, even if 'n' is zero.  This wrapper tolerates
@@ -192,6 +222,7 @@ bool str_to_long(const char *, int base, long *);
 bool str_to_llong(const char *, int base, long long *);
 bool str_to_llong_with_tail(const char *, char **, int base, long long *);
 bool str_to_uint(const char *, int base, unsigned int *);
+bool str_to_ullong(const char *, int base, unsigned long long *);
 bool str_to_llong_range(const char *, int base, long long *, long long *);
 
 bool ovs_scan(const char *s, const char *format, ...) OVS_SCANF_FORMAT(2, 3);
@@ -199,7 +230,7 @@ bool ovs_scan_len(const char *s, int *n, const char *format, ...);
 
 bool str_to_double(const char *, double *);
 
-int hexit_value(int c);
+int hexit_value(unsigned char c);
 uintmax_t hexits_value(const char *s, size_t n, bool *ok);
 
 int parse_int_string(const char *s, uint8_t *valuep, int field_width,
@@ -213,6 +244,7 @@ char *dir_name(const char *file_name);
 char *base_name(const char *file_name);
 #endif
 char *abs_file_name(const char *dir, const char *file_name);
+bool is_file_name_absolute(const char *);
 
 char *follow_symlinks(const char *filename);
 
@@ -332,8 +364,10 @@ log_2_ceil(uint64_t n)
 static inline unsigned int
 count_1bits(uint64_t x)
 {
-#if __GNUC__ >= 4 && __POPCNT__
+#if (__GNUC__ >= 4 && __POPCNT__) || (defined(__aarch64__) && __GNUC__ >= 7)
     return __builtin_popcountll(x);
+#elif defined(__aarch64__) && __GNUC__ >= 6
+    return vaddv_u8(vcnt_u8(vcreate_u8(x)));
 #else
     /* This portable implementation is the fastest one we know of for 64
      * bits, and about 3x faster than GCC 4.7 __builtin_popcountll(). */
@@ -415,6 +449,38 @@ static inline ovs_be32 be32_prefix_mask(int plen)
     return htonl((uint64_t)UINT32_MAX << (32 - plen));
 }
 
+/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
+ * false otherwise. */
+static inline bool
+uint_is_superset(uintmax_t super, uintmax_t sub)
+{
+    return (super & sub) == sub;
+}
+
+/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
+ * false otherwise. */
+static inline bool
+be16_is_superset(ovs_be16 super, ovs_be16 sub)
+{
+    return (super & sub) == sub;
+}
+
+/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
+ * false otherwise. */
+static inline bool
+be32_is_superset(ovs_be32 super, ovs_be32 sub)
+{
+    return (super & sub) == sub;
+}
+
+/* Returns true if the 1-bits in 'super' are a superset of the 1-bits in 'sub',
+ * false otherwise. */
+static inline bool
+be64_is_superset(ovs_be64 super, ovs_be64 sub)
+{
+    return (super & sub) == sub;
+}
+
 bool is_all_zeros(const void *, size_t);
 bool is_all_ones(const void *, size_t);
 bool is_all_byte(const void *, size_t, uint8_t byte);
@@ -488,7 +554,22 @@ ovs_u128_and(const ovs_u128 a, const ovs_u128 b)
     return dst;
 }
 
+static inline bool
+ovs_be128_is_superset(ovs_be128 super, ovs_be128 sub)
+{
+    return (be64_is_superset(super.be64.hi, sub.be64.hi) &&
+            be64_is_superset(super.be64.lo, sub.be64.lo));
+}
+
+static inline bool
+ovs_u128_is_superset(ovs_u128 super, ovs_u128 sub)
+{
+    return (uint_is_superset(super.u64.hi, sub.u64.hi) &&
+            uint_is_superset(super.u64.lo, sub.u64.lo));
+}
+
 void xsleep(unsigned int seconds);
+void xnanosleep(uint64_t nanoseconds);
 
 bool is_stdout_a_tty(void);
 

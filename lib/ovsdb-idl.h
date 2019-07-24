@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
+/* Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2019 Nicira, Inc.
  * Copyright (C) 2016 Hewlett Packard Enterprise Development LP
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +44,10 @@
 #include "ovsdb-condition.h"
 #include "skiplist.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct json;
 struct ovsdb_datum;
 struct ovsdb_idl_class;
@@ -56,8 +60,13 @@ struct ovsdb_idl *ovsdb_idl_create(const char *remote,
                                    const struct ovsdb_idl_class *,
                                    bool monitor_everything_by_default,
                                    bool retry);
+struct ovsdb_idl *ovsdb_idl_create_unconnected(
+    const struct ovsdb_idl_class *, bool monitor_everything_by_default);
 void ovsdb_idl_set_remote(struct ovsdb_idl *, const char *, bool);
+void ovsdb_idl_set_shuffle_remotes(struct ovsdb_idl *, bool);
 void ovsdb_idl_destroy(struct ovsdb_idl *);
+
+void ovsdb_idl_set_leader_only(struct ovsdb_idl *, bool leader_only);
 
 void ovsdb_idl_run(struct ovsdb_idl *);
 void ovsdb_idl_wait(struct ovsdb_idl *);
@@ -74,6 +83,7 @@ void ovsdb_idl_force_reconnect(struct ovsdb_idl *);
 void ovsdb_idl_verify_write_only(struct ovsdb_idl *);
 
 bool ovsdb_idl_is_alive(const struct ovsdb_idl *);
+bool ovsdb_idl_is_connected(const struct ovsdb_idl *idl);
 int ovsdb_idl_get_last_error(const struct ovsdb_idl *);
 
 void ovsdb_idl_set_probe_interval(const struct ovsdb_idl *, int probe_interval);
@@ -84,29 +94,79 @@ const struct ovsdb_idl_class *ovsdb_idl_get_class(const struct ovsdb_idl *);
 const struct ovsdb_idl_table_class *ovsdb_idl_table_class_from_column(
     const struct ovsdb_idl_class *, const struct ovsdb_idl_column *);
 
-/* Choosing columns and tables to replicate. */
+/* Choosing columns and tables to replicate.
+ *
+ * The client may choose any subset of the columns and tables to replicate,
+ * specifying it one of two ways:
+ *
+ *   - As a blacklist (adding the columns or tables to replicate).  To do so,
+ *     the client passes false as 'monitor_everything_by_default' to
+ *     ovsdb_idl_create() and then calls ovsdb_idl_add_column() and
+ *     ovsdb_idl_add_table() for the desired columns and, if necessary, tables.
+ *
+ *   - As a whitelist (replicating all columns and tables except those
+ *     explicitly removed).  To do so, the client passes true as
+ *     'monitor_everything_by_default' to ovsdb_idl_create() and then calls
+ *     ovsdb_idl_omit() to remove columns.
+ *
+ * There are multiple modes a column may be replicated:
+ *
+ *   - Read-only.  This is the default.  Whenever the column changes in any
+ *     replicated row, the value returned by ovsdb_idl_get_seqno() will change,
+ *     letting the client know to look at the replicated data again.
+ *
+ *   - Write-only.  This is for columns that the client sets and updates but
+ *     does not want to be alerted about its own updates (which, at the OVSDB
+ *     level, cannot be distinguished from updates made by any other client).
+ *     The column will be replicated in the same way as for read-only columns,
+ *     but the value returned by ovsdb_idl_get_seqno() will not change when the
+ *     column changes, saving wasted CPU time.
+ *
+ *     (A "write-only" client probably does read the column so that it can know
+ *     whether it needs to update it, but it doesn't expect to react to changes
+ *     by other clients.)
+ *
+ *     To mark a replicated column as write-only, a client calls
+ *     ovsdb_idl_omit_alert().  (The column must already be replicated one of
+ *     the ways described in the previous list.)
+ *
+ *     This is an optimization only and does not affect behavioral correctness
+ *     of an otherwise well-written client.
+ *
+ *   - Read/write.  In theory, an OVSDB client might both read and write a
+ *     column, although OVSDB schemas are usually designed so that any given
+ *     client only does one or the other.  This is actually the same as
+ *     read/write columns; that is, the client need take no special action.
+ */
 
-/* Modes with which the IDL can monitor a column.
+/* Modes with which the IDL can replicate a column.  See above comment for
+ * overview.
  *
- * If no bits are set, the column is not monitored at all.  Its value will
- * always appear to the client to be the default value for its type.
+ * If no bits are set, the IDL does not replicate the column at all.  The
+ * client will always see it with the default value for its type.
  *
- * If OVSDB_IDL_MONITOR is set, then the column is replicated.  Its value will
- * reflect the value in the database.  If OVSDB_IDL_ALERT is also set, then the
- * value returned by ovsdb_idl_get_seqno() will change when the column's value
- * changes.
+ * If OVSDB_IDL_MONITOR is set, then the IDL replicates the column and sets it
+ * to to the value in the database.  If OVSDB_IDL_ALERT is also set, then the
+ * IDL will change the value returned by ovsdb_idl_get_seqno() when the
+ * column's value changes in any row.
  *
  * The possible mode combinations are:
  *
- *   - 0, for a column that a client doesn't care about.
+ *   - 0, for a column that a client doesn't care about.  This is the default
+ *     for every column in every table, if the client passes false for
+ *     'monitor_everything_by_default' to ovsdb_idl_create().
  *
  *   - (OVSDB_IDL_MONITOR | OVSDB_IDL_ALERT), for a column that a client wants
- *     to track and possibly update.
+ *     to track and possibly update.  This is the default for every column in
+ *     every table, if the client passes true for
+ *     'monitor_everything_by_default' to ovsdb_idl_create().
  *
  *   - OVSDB_IDL_MONITOR, for columns that a client treats as "write-only",
  *     that is, it updates them but doesn't want to get alerted about its own
  *     updates.  It also won't be alerted about other clients' updates, so this
  *     is suitable only for use by a client that "owns" a particular column.
+ *     Use ovsdb_idl_omit_alert() to set a column that is already replicated to
+ *     this mode.
  *
  *   - OVDSB_IDL_ALERT without OVSDB_IDL_MONITOR is not valid.
  *
@@ -114,8 +174,8 @@ const struct ovsdb_idl_table_class *ovsdb_idl_table_class_from_column(
  *     that a client wants to track using the change tracking
  *     ovsdb_idl_track_get_*() functions.
  */
-#define OVSDB_IDL_MONITOR (1 << 0) /* Monitor this column? */
-#define OVSDB_IDL_ALERT   (1 << 1) /* Alert client when column updated? */
+#define OVSDB_IDL_MONITOR (1 << 0) /* Replicate this column? */
+#define OVSDB_IDL_ALERT   (1 << 1) /* Alert client when column changes? */
 #define OVSDB_IDL_TRACK   (1 << 2)
 
 void ovsdb_idl_add_column(struct ovsdb_idl *, const struct ovsdb_idl_column *);
@@ -162,7 +222,7 @@ const struct ovsdb_idl_row *ovsdb_idl_track_get_first(
 const struct ovsdb_idl_row *ovsdb_idl_track_get_next(const struct ovsdb_idl_row *);
 bool ovsdb_idl_track_is_updated(const struct ovsdb_idl_row *row,
                                 const struct ovsdb_idl_column *column);
-void ovsdb_idl_track_clear(const struct ovsdb_idl *);
+void ovsdb_idl_track_clear(struct ovsdb_idl *);
 
 
 /* Reading the database replica. */
@@ -360,53 +420,60 @@ unsigned int ovsdb_idl_set_condition(struct ovsdb_idl *,
                                      const struct ovsdb_idl_condition *);
 
 unsigned int ovsdb_idl_get_condition_seqno(const struct ovsdb_idl *);
+
+/* Indexes over one or more columns in the IDL, to retrieve rows matching
+ * particular search criteria and to iterate over a subset of rows in a defined
+ * order. */
 
-/* The OVSDB-IDL Compound Indexes feature allows for the creation of custom
- * table indexes over one or more columns in the IDL. These indexes provide
- * the ability to retrieve rows matching a particular search criteria and to
- * iterate over a subset of rows in a defined order.
- */
-
-#define OVSDB_INDEX_DESC -1
-#define OVSDB_INDEX_ASC 1
-
-/*
- * Skiplist comparison function. Allows to store sorted data.
- */
-typedef int (column_comparator)(const void *a, const void *b);
-
-struct ovsdb_idl_index_cursor {
-    struct ovsdb_idl_index *index;    /* Index used by this cursor */
-    struct skiplist_node *position;   /* Current position in the index */
+enum ovsdb_index_order {
+    OVSDB_INDEX_ASC,            /* 0, 1, 2, ... */
+    OVSDB_INDEX_DESC            /* 2, 1, 0, ... */
 };
 
-struct ovsdb_idl_index *ovsdb_idl_create_index(struct ovsdb_idl *idl,
-                                        const struct ovsdb_idl_table_class *tc,
-                                        const char *index_name);
-void ovsdb_idl_index_add_column(struct ovsdb_idl_index *,
-                                const struct ovsdb_idl_column *,
-                                int order,
-                                column_comparator *custom_comparer);
-bool ovsdb_idl_initialize_cursor(struct ovsdb_idl *,
-                            const struct ovsdb_idl_table_class *tc,
-                            const char *index_name,
-                            struct ovsdb_idl_index_cursor *cursor);
-void ovsdb_idl_index_write_(struct ovsdb_idl_row *,
-                            const struct ovsdb_idl_column *,
-                            struct ovsdb_datum *,
-                            const struct ovsdb_idl_table_class *);
-struct ovsdb_idl_row *ovsdb_idl_index_init_row(struct ovsdb_idl *,
-                                       const struct ovsdb_idl_table_class *);
-void ovsdb_idl_index_destroy_row__(const struct ovsdb_idl_row *);
-struct ovsdb_idl_row *ovsdb_idl_index_first(struct ovsdb_idl_index_cursor *);
-struct ovsdb_idl_row *ovsdb_idl_index_next(struct ovsdb_idl_index_cursor *);
-struct ovsdb_idl_row *ovsdb_idl_index_data(struct ovsdb_idl_index_cursor *);
-struct ovsdb_idl_row *ovsdb_idl_index_find(struct ovsdb_idl_index_cursor *,
-                                           struct ovsdb_idl_row *);
-struct ovsdb_idl_row *ovsdb_idl_index_forward_to(
-                                               struct ovsdb_idl_index_cursor *,
-                                               struct ovsdb_idl_row *);
-int ovsdb_idl_index_compare(struct ovsdb_idl_index_cursor *,
-                            struct ovsdb_idl_row *a,
-                            struct ovsdb_idl_row *b);
+typedef int column_comparator_func(const void *a, const void *b);
+
+struct ovsdb_idl_index_column {
+    const struct ovsdb_idl_column *column;
+    column_comparator_func *comparer;
+    enum ovsdb_index_order order;
+};
+
+/* Creating an index. */
+struct ovsdb_idl_index *ovsdb_idl_index_create(
+    struct ovsdb_idl *, const struct ovsdb_idl_index_column *, size_t n);
+struct ovsdb_idl_index *ovsdb_idl_index_create1(
+    struct ovsdb_idl *, const struct ovsdb_idl_column *);
+struct ovsdb_idl_index *ovsdb_idl_index_create2(
+    struct ovsdb_idl *, const struct ovsdb_idl_column *,
+    const struct ovsdb_idl_column *);
+
+/* Searching an index. */
+struct ovsdb_idl_row *ovsdb_idl_index_find(struct ovsdb_idl_index *,
+                                           const struct ovsdb_idl_row *);
+
+/* Iteration over an index.
+ *
+ * Usually these would be invoked through table-specific wrappers generated
+ * by the IDL. */
+
+struct ovsdb_idl_cursor {
+    struct ovsdb_idl_index *index;  /* Index being iterated. */
+    struct skiplist_node *position; /* Current position in 'index'. */
+};
+
+struct ovsdb_idl_cursor ovsdb_idl_cursor_first(struct ovsdb_idl_index *);
+struct ovsdb_idl_cursor ovsdb_idl_cursor_first_eq(
+    struct ovsdb_idl_index *, const struct ovsdb_idl_row *);
+struct ovsdb_idl_cursor ovsdb_idl_cursor_first_ge(
+    struct ovsdb_idl_index *, const struct ovsdb_idl_row *);
+
+void ovsdb_idl_cursor_next(struct ovsdb_idl_cursor *);
+void ovsdb_idl_cursor_next_eq(struct ovsdb_idl_cursor *);
+
+struct ovsdb_idl_row *ovsdb_idl_cursor_data(struct ovsdb_idl_cursor *);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* ovsdb-idl.h */

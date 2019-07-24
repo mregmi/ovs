@@ -16,6 +16,7 @@
 #include "bfd.h"
 
 #include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
@@ -37,7 +38,7 @@
 #include "ovs-thread.h"
 #include "openvswitch/types.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "seq.h"
 #include "smap.h"
@@ -612,7 +613,7 @@ bfd_put_packet(struct bfd *bfd, struct dp_packet *p,
     ip->ip_ihl_ver = IP_IHL_VER(5, 4);
     ip->ip_tot_len = htons(sizeof *ip + sizeof *udp + sizeof *msg);
     ip->ip_ttl = MAXTTL;
-    ip->ip_tos = IPTOS_LOWDELAY | IPTOS_THROUGHPUT;
+    ip->ip_tos = IPTOS_PREC_INTERNETCONTROL;
     ip->ip_proto = IPPROTO_UDP;
     put_16aligned_be32(&ip->ip_src, bfd->ip_src);
     put_16aligned_be32(&ip->ip_dst, bfd->ip_dst);
@@ -671,19 +672,18 @@ bfd_should_process_flow(const struct bfd *bfd_, const struct flow *flow,
 
     if (flow->dl_type == htons(ETH_TYPE_IP)) {
         memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
-        if (flow->nw_proto == IPPROTO_UDP && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
-            memset(&wc->masks.tp_dst, 0xff, sizeof wc->masks.tp_dst);
-            if (flow->tp_dst == htons(BFD_DEST_PORT)) {
-                bool check_tnl_key;
+        if (flow->nw_proto == IPPROTO_UDP
+            && !(flow->nw_frag & FLOW_NW_FRAG_LATER)
+            && tp_dst_equals(flow, BFD_DEST_PORT, wc)) {
+            bool check_tnl_key;
 
-                atomic_read_relaxed(&bfd->check_tnl_key, &check_tnl_key);
-                if (check_tnl_key) {
-                    memset(&wc->masks.tunnel.tun_id, 0xff,
-                           sizeof wc->masks.tunnel.tun_id);
-                    return flow->tunnel.tun_id == htonll(0);
-                }
-                return true;
+            atomic_read_relaxed(&bfd->check_tnl_key, &check_tnl_key);
+            if (check_tnl_key) {
+                memset(&wc->masks.tunnel.tun_id, 0xff,
+                       sizeof wc->masks.tunnel.tun_id);
+                return flow->tunnel.tun_id == htonll(0);
             }
+            return true;
         }
     }
     return false;
@@ -1084,13 +1084,13 @@ log_msg(enum vlog_level level, const struct msg *p, const char *message,
 
     ds_put_format(&ds,
                   "%s: %s."
-                  "\n\tvers:%d diag:\"%s\" state:%s mult:%"PRIu8
+                  "\n  vers:%d diag:\"%s\" state:%s mult:%"PRIu8
                   " length:%"PRIu8
-                  "\n\tflags: %s"
-                  "\n\tmy_disc:0x%"PRIx32" your_disc:0x%"PRIx32
-                  "\n\tmin_tx:%"PRIu32"us (%"PRIu32"ms)"
-                  "\n\tmin_rx:%"PRIu32"us (%"PRIu32"ms)"
-                  "\n\tmin_rx_echo:%"PRIu32"us (%"PRIu32"ms)",
+                  "\n  flags: %s"
+                  "\n  my_disc:0x%"PRIx32" your_disc:0x%"PRIx32
+                  "\n  min_tx:%"PRIu32"us (%"PRIu32"ms)"
+                  "\n  min_rx:%"PRIu32"us (%"PRIu32"ms)"
+                  "\n  min_rx_echo:%"PRIu32"us (%"PRIu32"ms)",
                   bfd->name, message, p->vers_diag >> VERS_SHIFT,
                   bfd_diag_str(p->vers_diag & DIAG_MASK),
                   bfd_state_str(p->flags & STATE_MASK),
@@ -1253,45 +1253,45 @@ bfd_find_by_name(const char *name) OVS_REQUIRES(mutex)
 static void
 bfd_put_details(struct ds *ds, const struct bfd *bfd) OVS_REQUIRES(mutex)
 {
-    ds_put_format(ds, "\tForwarding: %s\n",
+    ds_put_format(ds, "  Forwarding: %s\n",
                   bfd_forwarding__(CONST_CAST(struct bfd *, bfd))
                   ? "true" : "false");
-    ds_put_format(ds, "\tDetect Multiplier: %d\n", bfd->mult);
-    ds_put_format(ds, "\tConcatenated Path Down: %s\n",
+    ds_put_format(ds, "  Detect Multiplier: %d\n", bfd->mult);
+    ds_put_format(ds, "  Concatenated Path Down: %s\n",
                   bfd->cpath_down ? "true" : "false");
-    ds_put_format(ds, "\tTX Interval: Approx %lldms\n", bfd_tx_interval(bfd));
-    ds_put_format(ds, "\tRX Interval: Approx %lldms\n", bfd_rx_interval(bfd));
-    ds_put_format(ds, "\tDetect Time: now %+lldms\n",
+    ds_put_format(ds, "  TX Interval: Approx %lldms\n", bfd_tx_interval(bfd));
+    ds_put_format(ds, "  RX Interval: Approx %lldms\n", bfd_rx_interval(bfd));
+    ds_put_format(ds, "  Detect Time: now %+lldms\n",
                   bfd->detect_time - time_msec());
-    ds_put_format(ds, "\tNext TX Time: now %+lldms\n",
+    ds_put_format(ds, "  Next TX Time: now %+lldms\n",
                   bfd->next_tx -time_msec());
-    ds_put_format(ds, "\tLast TX Time: now %+lldms\n",
+    ds_put_format(ds, "  Last TX Time: now %+lldms\n",
                   bfd->last_tx - time_msec());
 
     ds_put_cstr(ds, "\n");
 
-    ds_put_format(ds, "\tLocal Flags: %s\n", bfd_flag_str(bfd->flags));
-    ds_put_format(ds, "\tLocal Session State: %s\n",
+    ds_put_format(ds, "  Local Flags: %s\n", bfd_flag_str(bfd->flags));
+    ds_put_format(ds, "  Local Session State: %s\n",
                   bfd_state_str(bfd->state));
-    ds_put_format(ds, "\tLocal Diagnostic: %s\n", bfd_diag_str(bfd->diag));
-    ds_put_format(ds, "\tLocal Discriminator: 0x%"PRIx32"\n", bfd->disc);
-    ds_put_format(ds, "\tLocal Minimum TX Interval: %lldms\n",
+    ds_put_format(ds, "  Local Diagnostic: %s\n", bfd_diag_str(bfd->diag));
+    ds_put_format(ds, "  Local Discriminator: 0x%"PRIx32"\n", bfd->disc);
+    ds_put_format(ds, "  Local Minimum TX Interval: %lldms\n",
                   bfd_min_tx(bfd));
-    ds_put_format(ds, "\tLocal Minimum RX Interval: %lldms\n", bfd->min_rx);
+    ds_put_format(ds, "  Local Minimum RX Interval: %lldms\n", bfd->min_rx);
 
     ds_put_cstr(ds, "\n");
 
-    ds_put_format(ds, "\tRemote Flags: %s\n", bfd_flag_str(bfd->rmt_flags));
-    ds_put_format(ds, "\tRemote Session State: %s\n",
+    ds_put_format(ds, "  Remote Flags: %s\n", bfd_flag_str(bfd->rmt_flags));
+    ds_put_format(ds, "  Remote Session State: %s\n",
                   bfd_state_str(bfd->rmt_state));
-    ds_put_format(ds, "\tRemote Diagnostic: %s\n",
+    ds_put_format(ds, "  Remote Diagnostic: %s\n",
                   bfd_diag_str(bfd->rmt_diag));
-    ds_put_format(ds, "\tRemote Discriminator: 0x%"PRIx32"\n", bfd->rmt_disc);
-    ds_put_format(ds, "\tRemote Minimum TX Interval: %lldms\n",
+    ds_put_format(ds, "  Remote Discriminator: 0x%"PRIx32"\n", bfd->rmt_disc);
+    ds_put_format(ds, "  Remote Minimum TX Interval: %lldms\n",
                   bfd->rmt_min_tx);
-    ds_put_format(ds, "\tRemote Minimum RX Interval: %lldms\n",
+    ds_put_format(ds, "  Remote Minimum RX Interval: %lldms\n",
                   bfd->rmt_min_rx);
-    ds_put_format(ds, "\tRemote Detect Multiplier: %d\n", bfd->rmt_mult);
+    ds_put_format(ds, "  Remote Detect Multiplier: %d\n", bfd->rmt_mult);
 }
 
 static void

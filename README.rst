@@ -1,5 +1,6 @@
-.. NOTE(stephenfin): If making changes to this file, ensure that the line
-   numbers found in 'Documentation/intro/what-is-ovs' are kept up-to-date.
+.. NOTE(stephenfin): If making changes to this file, ensure that the
+   start-after/end-before lines found in 'Documentation/intro/what-is-ovs'
+   are kept up-to-date.
 
 ============
 Open vSwitch
@@ -9,6 +10,8 @@ Open vSwitch
     :target: https://travis-ci.org/openvswitch/ovs
 .. image:: https://ci.appveyor.com/api/projects/status/github/openvswitch/ovs?branch=master&svg=true&retina=true
     :target: https://ci.appveyor.com/project/blp/ovs/history
+.. image:: https://api.cirrus-ci.com/github/openvswitch/ovs.svg
+    :target: https://cirrus-ci.com/github/openvswitch/ovs
 
 What is Open vSwitch?
 ---------------------
@@ -93,6 +96,39 @@ the `tutorial <Documentation/tutorials/ovs-advanced.rst>`__.
 Each Open vSwitch userspace program is accompanied by a manpage.  Many of the
 manpages are customized to your configuration as part of the build process, so
 we recommend building Open vSwitch before reading the manpages.
+
+License
+-------
+
+The following is a summary of the licensing of files in this distribution.
+As mentioned, Open vSwitch is licensed under the open source Apache 2 license.
+Some files may be marked specifically with a different license, in which case
+that license applies to the file in question.
+
+
+Files under the datapath directory are licensed under the GNU General Public
+License, version 2.
+
+File build-aux/cccl is licensed under the GNU General Public License, version 2.
+
+The following files are licensed under the 2-clause BSD license.
+    include/windows/getopt.h
+    lib/getopt_long.c
+    lib/conntrack-tcp.c
+
+The following files are licensed under the 3-clause BSD-license
+    include/windows/netinet/icmp6.h
+    include/windows/netinet/ip6.h
+    lib/strsep.c
+
+Files under the xenserver directory are licensed on a file-by-file basis.
+Refer to each file for details.
+
+Files lib/sflow*.[ch] are licensed under the terms of either the
+Sun Industry Standards Source License 1.1, that is available at:
+        http://host-sflow.sourceforge.net/sissl.html
+or the InMon sFlow License, that is available at:
+        http://www.inmon.com/technology/sflowlicense.txt
 
 Contact
 -------

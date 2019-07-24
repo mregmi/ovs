@@ -36,23 +36,48 @@ RHEL 7.x and its derivatives, including CentOS 7.x and Scientific Linux 7.x.
 Build Requirements
 ------------------
 
-To build packages for a Fedora Linux host, you will need the packages described
-in the :doc:`general`. Specific packages (by package name) include:
+You will need to install all required packages to build the RPMs.
+Newer distributions use ``dnf`` but if it's not available, then use
+``yum`` instructions.
 
-- rpm-build
-- autoconf automake libtool
-- systemd-units openssl openssl-devel
-- python2-devel python3-devel
-- python2 python2-twisted python2-zope-interface python2-six
-- desktop-file-utils
-- groff graphviz
-- procps-ng
-- checkpolicy selinux-policy-devel
+The command below will install RPM tools and generic build dependencies.
+And (optionally) include these packages: libcap-ng libcap-ng-devel dpdk-devel.
 
-And (optionally):
+DNF:
+::
 
-- libcap-ng libcap-ng-devel
-- dpdk-devel
+    $ dnf install @'Development Tools' rpm-build dnf-plugins-core
+
+YUM:
+::
+
+    $ yum install @'Development Tools' rpm-build yum-utils
+
+Then it is necessary to install Open vSwitch specific build dependencies.
+The dependencies are listed in the SPEC file, but first it is necessary
+to replace the VERSION tag to be a valid SPEC.
+
+The command below will create a temporary SPEC file::
+
+    $ sed -e 's/@VERSION@/0.0.1/' rhel/openvswitch-fedora.spec.in \
+      > /tmp/ovs.spec
+
+And to install specific dependencies, use the corresponding tool below.
+For some of the dependencies on RHEL you may need to add two additional
+repositories to help yum-builddep, e.g.::
+
+    $ subscription-manager repos --enable=rhel-7-server-extras-rpms
+    $ subscription-manager repos --enable=rhel-7-server-optional-rpms
+
+DNF::
+
+    $ dnf builddep /tmp/ovs.spec
+
+YUM::
+
+    $ yum-builddep /tmp/ovs.spec
+
+Once that is completed, remove the file ``/tmp/ovs.spec``.
 
 Bootstraping
 ------------
@@ -78,9 +103,7 @@ in which `./configure` was executed:
     $ make rpm-fedora
 
 This will create the RPMs `openvswitch`, `python-openvswitch`,
-`openvswitch-test`, `openvswitch-devel`, `openvswitch-ovn-common`,
-`openvswitch-ovn-central`, `openvswitch-ovn-host`, `openvswitch-ovn-vtep`,
-`openvswitch-ovn-docker`, and `openvswitch-debuginfo`.
+`openvswitch-test`, `openvswitch-devel` and `openvswitch-debuginfo`.
 
 To enable DPDK support in the openvswitch package, the ``--with dpdk`` option
 can be added:
@@ -95,6 +118,17 @@ tests.  This can take several minutes.
 ::
 
     $ make rpm-fedora RPMBUILD_OPT="--with check"
+
+To build OVN RPMs, execute the following from the directory in which
+`./configure` was executed:
+
+::
+
+    $ make rpm-fedora-ovn
+
+This will create the RPMs `ovn`, `ovn-common`, `ovn-central`, `ovn-host`,
+`ovn-docker` and `ovn-vtep`.
+
 
 Kernel OVS Tree Datapath RPM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -131,7 +165,7 @@ In most cases only the `openvswitch` RPM will need to be installed. The
 `openvswitch-debuginfo` RPMs are optional unless required for a specific
 purpose.
 
-The `openvswitch-ovn-*` packages are only needed when using OVN.
+The `ovn-*` packages are only needed when using OVN.
 
 Refer to the `RHEL README`__ for additional usage and configuration
 information.

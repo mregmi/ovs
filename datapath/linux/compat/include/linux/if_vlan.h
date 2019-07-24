@@ -53,6 +53,25 @@ static inline struct sk_buff *rpl_vlan_insert_tag_set_proto(struct sk_buff *skb,
 }
 #endif
 
+#ifndef HAVE_VLAN_HWACCEL_CLEAR_TAG
+/**
+ * __vlan_hwaccel_clear_tag - clear hardware accelerated VLAN info
+ * @skb: skbuff to clear
+ *
+ * Clears the VLAN information from @skb
+ */
+#define __vlan_hwaccel_clear_tag rpl_vlan_hwaccel_clear_tag
+static inline void rpl_vlan_hwaccel_clear_tag(struct sk_buff *skb)
+{
+#ifdef HAVE_SKBUFF_VLAN_PRESENT
+	skb->vlan_present = 0;
+#else
+	skb->vlan_tci = 0;
+	skb->vlan_proto = 0;
+#endif
+}
+#endif
+
 #ifndef HAVE_VLAN_HWACCEL_PUSH_INSIDE
 
 /*
@@ -88,17 +107,6 @@ static inline struct sk_buff *vlan_hwaccel_push_inside(struct sk_buff *skb)
 		skb = __vlan_hwaccel_push_inside(skb);
 	return skb;
 }
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
-static inline struct sk_buff *rpl___vlan_hwaccel_put_tag(struct sk_buff *skb,
-						     __be16 vlan_proto,
-						     u16 vlan_tci)
-{
-	return __vlan_hwaccel_put_tag(skb, vlan_tci);
-}
-
-#define __vlan_hwaccel_put_tag rpl___vlan_hwaccel_put_tag
 #endif
 
 #ifndef HAVE_ETH_TYPE_VLAN

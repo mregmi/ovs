@@ -59,9 +59,12 @@
 #define OFP_ASSERT(EXPR)                                                \
         extern int (*build_assert(void))[ sizeof(struct {               \
                     unsigned int build_assert_failed : (EXPR) ? 1 : -1; })]
-#else /* __cplusplus */
+#elif __cplusplus >= 201103L
 #define OFP_ASSERT(EXPR) static_assert(EXPR, "assertion failed")
-#endif /* __cplusplus */
+#else  /* __cplusplus < 201103L */
+#include <boost/static_assert.hpp>
+#define OFP_ASSERT BOOST_STATIC_ASSERT
+#endif /* __cplusplus < 201103L */
 
 /* Version number:
  * Non-experimental versions released: 0x01 0x02
@@ -76,8 +79,7 @@ enum ofp_version {
     OFP12_VERSION = 0x03,
     OFP13_VERSION = 0x04,
     OFP14_VERSION = 0x05,
-    OFP15_VERSION = 0x06,
-    OFP16_VERSION = 0x07
+    OFP15_VERSION = 0x06
 };
 
 /* Vendor (aka experimenter) IDs.
@@ -110,6 +112,7 @@ enum ofp_version {
 #define INTEL_VENDOR_ID 0x0000AA01 /* Intel */
 
 #define OFP_MAX_TABLE_NAME_LEN 32
+#define OFP_MAX_PORT_NAME_LEN  16
 
 #define OFP_OLD_PORT  6633
 #define OFP_PORT  6653

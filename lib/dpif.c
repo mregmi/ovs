@@ -34,10 +34,9 @@
 #include "odp-execute.h"
 #include "odp-util.h"
 #include "openvswitch/ofp-print.h"
-#include "openvswitch/ofp-util.h"
 #include "openvswitch/ofpbuf.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "route-table.h"
 #include "seq.h"
 #include "openvswitch/shash.h"
@@ -50,6 +49,7 @@
 #include "valgrind.h"
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/vlog.h"
+#include "lib/netdev-provider.h"
 
 VLOG_DEFINE_THIS_MODULE(dpif);
 
@@ -101,12 +101,9 @@ static bool should_log_flow_message(const struct vlog_module *module,
 struct seq *tnl_conf_seq;
 
 static bool
-dpif_is_internal_port(const char *type)
+dpif_is_tap_port(const char *type)
 {
-    /* For userspace datapath, tap devices are the equivalent
-     * of internal devices in the kernel datapath, so both
-     * these types are 'internal' devices. */
-    return !strcmp(type, "internal") || !strcmp(type, "tap");
+    return !strcmp(type, "tap");
 }
 
 static void
@@ -359,7 +356,7 @@ do_open(const char *name, const char *type, bool create, struct dpif **dpifp)
             struct netdev *netdev;
             int err;
 
-            if (dpif_is_internal_port(dpif_port.type)) {
+            if (dpif_is_tap_port(dpif_port.type)) {
                 continue;
             }
 
@@ -370,7 +367,7 @@ do_open(const char *name, const char *type, bool create, struct dpif **dpifp)
                 netdev_close(netdev);
             } else {
                 VLOG_WARN("could not open netdev %s type %s: %s",
-			  dpif_port.name, dpif_port.type, ovs_strerror(err));
+                          dpif_port.name, dpif_port.type, ovs_strerror(err));
             }
         }
     } else {
@@ -434,7 +431,7 @@ dpif_remove_netdev_ports(struct dpif *dpif) {
         struct dpif_port dpif_port;
 
         DPIF_PORT_FOR_EACH (&dpif_port, &port_dump, dpif) {
-            if (!dpif_is_internal_port(dpif_port.type)) {
+            if (!dpif_is_tap_port(dpif_port.type)) {
                 netdev_ports_remove(dpif_port.port_no, dpif->dpif_class);
             }
         }
@@ -499,6 +496,13 @@ const char *
 dpif_type(const struct dpif *dpif)
 {
     return dpif->dpif_class->type;
+}
+
+/* Checks if datapath 'dpif' requires cleanup. */
+bool
+dpif_cleanup_required(const struct dpif *dpif)
+{
+    return dpif->dpif_class->cleanup_required;
 }
 
 /* Returns the fully spelled out name for the given datapath 'type'.
@@ -582,7 +586,7 @@ dpif_port_add(struct dpif *dpif, struct netdev *netdev, odp_port_t *port_nop)
         VLOG_DBG_RL(&dpmsg_rl, "%s: added %s as port %"PRIu32,
                     dpif_name(dpif), netdev_name, port_no);
 
-        if (!dpif_is_internal_port(netdev_get_type(netdev))) {
+        if (!dpif_is_tap_port(netdev_get_type(netdev))) {
 
             struct dpif_port dpif_port;
 
@@ -605,21 +609,23 @@ dpif_port_add(struct dpif *dpif, struct netdev *netdev, odp_port_t *port_nop)
 /* Attempts to remove 'dpif''s port number 'port_no'.  Returns 0 if successful,
  * otherwise a positive errno value. */
 int
-dpif_port_del(struct dpif *dpif, odp_port_t port_no)
+dpif_port_del(struct dpif *dpif, odp_port_t port_no, bool local_delete)
 {
-    int error;
+    int error = 0;
 
     COVERAGE_INC(dpif_port_del);
 
-    error = dpif->dpif_class->port_del(dpif, port_no);
-    if (!error) {
-        VLOG_DBG_RL(&dpmsg_rl, "%s: port_del(%"PRIu32")",
-                    dpif_name(dpif), port_no);
-
-        netdev_ports_remove(port_no, dpif->dpif_class);
-    } else {
-        log_operation(dpif, "port_del", error);
+    if (!local_delete) {
+        error = dpif->dpif_class->port_del(dpif, port_no);
+        if (!error) {
+            VLOG_DBG_RL(&dpmsg_rl, "%s: port_del(%"PRIu32")",
+                        dpif_name(dpif), port_no);
+        } else {
+            log_operation(dpif, "port_del", error);
+        }
     }
+
+    netdev_ports_remove(port_no, dpif->dpif_class);
     return error;
 }
 
@@ -731,16 +737,7 @@ dpif_port_query_by_name(const struct dpif *dpif, const char *devname,
 
 /* Returns the Netlink PID value to supply in OVS_ACTION_ATTR_USERSPACE
  * actions as the OVS_USERSPACE_ATTR_PID attribute's value, for use in
- * flows whose packets arrived on port 'port_no'.  In the case where the
- * provider allocates multiple Netlink PIDs to a single port, it may use
- * 'hash' to spread load among them.  The caller need not use a particular
- * hash function; a 5-tuple hash is suitable.
- *
- * (The datapath implementation might use some different hash function for
- * distributing packets received via flow misses among PIDs.  This means
- * that packets received via flow misses might be reordered relative to
- * packets received via userspace actions.  This is not ordinarily a
- * problem.)
+ * flows whose packets arrived on port 'port_no'.
  *
  * A 'port_no' of ODPP_NONE is a special case: it returns a reserved PID, not
  * allocated to any port, that the client may use for special purposes.
@@ -751,10 +748,10 @@ dpif_port_query_by_name(const struct dpif *dpif, const char *devname,
  * update all of the flows that it installed that contain
  * OVS_ACTION_ATTR_USERSPACE actions. */
 uint32_t
-dpif_port_get_pid(const struct dpif *dpif, odp_port_t port_no, uint32_t hash)
+dpif_port_get_pid(const struct dpif *dpif, odp_port_t port_no)
 {
     return (dpif->dpif_class->port_get_pid
-            ? (dpif->dpif_class->port_get_pid)(dpif, port_no, hash)
+            ? (dpif->dpif_class->port_get_pid)(dpif, port_no)
             : 0);
 }
 
@@ -997,19 +994,19 @@ dpif_flow_get(struct dpif *dpif,
     struct dpif_op op;
 
     op.type = DPIF_OP_FLOW_GET;
-    op.u.flow_get.key = key;
-    op.u.flow_get.key_len = key_len;
-    op.u.flow_get.ufid = ufid;
-    op.u.flow_get.pmd_id = pmd_id;
-    op.u.flow_get.buffer = buf;
+    op.flow_get.key = key;
+    op.flow_get.key_len = key_len;
+    op.flow_get.ufid = ufid;
+    op.flow_get.pmd_id = pmd_id;
+    op.flow_get.buffer = buf;
 
     memset(flow, 0, sizeof *flow);
-    op.u.flow_get.flow = flow;
-    op.u.flow_get.flow->key = key;
-    op.u.flow_get.flow->key_len = key_len;
+    op.flow_get.flow = flow;
+    op.flow_get.flow->key = key;
+    op.flow_get.flow->key_len = key_len;
 
     opp = &op;
-    dpif_operate(dpif, &opp, 1);
+    dpif_operate(dpif, &opp, 1, DPIF_OFFLOAD_AUTO);
 
     return op.error;
 }
@@ -1027,19 +1024,19 @@ dpif_flow_put(struct dpif *dpif, enum dpif_flow_put_flags flags,
     struct dpif_op op;
 
     op.type = DPIF_OP_FLOW_PUT;
-    op.u.flow_put.flags = flags;
-    op.u.flow_put.key = key;
-    op.u.flow_put.key_len = key_len;
-    op.u.flow_put.mask = mask;
-    op.u.flow_put.mask_len = mask_len;
-    op.u.flow_put.actions = actions;
-    op.u.flow_put.actions_len = actions_len;
-    op.u.flow_put.ufid = ufid;
-    op.u.flow_put.pmd_id = pmd_id;
-    op.u.flow_put.stats = stats;
+    op.flow_put.flags = flags;
+    op.flow_put.key = key;
+    op.flow_put.key_len = key_len;
+    op.flow_put.mask = mask;
+    op.flow_put.mask_len = mask_len;
+    op.flow_put.actions = actions;
+    op.flow_put.actions_len = actions_len;
+    op.flow_put.ufid = ufid;
+    op.flow_put.pmd_id = pmd_id;
+    op.flow_put.stats = stats;
 
     opp = &op;
-    dpif_operate(dpif, &opp, 1);
+    dpif_operate(dpif, &opp, 1, DPIF_OFFLOAD_AUTO);
 
     return op.error;
 }
@@ -1054,15 +1051,15 @@ dpif_flow_del(struct dpif *dpif,
     struct dpif_op op;
 
     op.type = DPIF_OP_FLOW_DEL;
-    op.u.flow_del.key = key;
-    op.u.flow_del.key_len = key_len;
-    op.u.flow_del.ufid = ufid;
-    op.u.flow_del.pmd_id = pmd_id;
-    op.u.flow_del.stats = stats;
-    op.u.flow_del.terse = false;
+    op.flow_del.key = key;
+    op.flow_del.key_len = key_len;
+    op.flow_del.ufid = ufid;
+    op.flow_del.pmd_id = pmd_id;
+    op.flow_del.stats = stats;
+    op.flow_del.terse = false;
 
     opp = &op;
-    dpif_operate(dpif, &opp, 1);
+    dpif_operate(dpif, &opp, 1, DPIF_OFFLOAD_AUTO);
 
     return op.error;
 }
@@ -1074,9 +1071,10 @@ dpif_flow_del(struct dpif *dpif,
  * This function always successfully returns a dpif_flow_dump.  Error
  * reporting is deferred to dpif_flow_dump_destroy(). */
 struct dpif_flow_dump *
-dpif_flow_dump_create(const struct dpif *dpif, bool terse, char *type)
+dpif_flow_dump_create(const struct dpif *dpif, bool terse,
+                      struct dpif_flow_dump_types *types)
 {
-    return dpif->dpif_class->flow_dump_create(dpif, terse, type);
+    return dpif->dpif_class->flow_dump_create(dpif, terse, types);
 }
 
 /* Destroys 'dump', which must have been created with dpif_flow_dump_create().
@@ -1161,13 +1159,13 @@ struct dpif_execute_helper_aux {
  * meaningful. */
 static void
 dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
-                       const struct nlattr *action, bool may_steal)
+                       const struct nlattr *action, bool should_steal)
 {
     struct dpif_execute_helper_aux *aux = aux_;
     int type = nl_attr_type(action);
     struct dp_packet *packet = packets_->packets[0];
 
-    ovs_assert(packets_->count == 1);
+    ovs_assert(dp_packet_batch_size(packets_) == 1);
 
     switch ((enum ovs_action_attr)type) {
     case OVS_ACTION_ATTR_METER:
@@ -1175,7 +1173,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
         if (!aux->meter_action) {
             aux->meter_action = action;
         }
-	break;
+        break;
 
     case OVS_ACTION_ATTR_CT:
     case OVS_ACTION_ATTR_OUTPUT:
@@ -1215,7 +1213,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
              * that we supply as metadata.  We have to use a "set" action to
              * supply it. */
             if (md->tunnel.ip_dst) {
-                odp_put_tunnel_action(&md->tunnel, &execute_actions);
+                odp_put_tunnel_action(&md->tunnel, &execute_actions, NULL);
             }
             ofpbuf_put(&execute_actions, action, NLA_ALIGN(action->nla_len));
 
@@ -1233,7 +1231,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
                         || type == OVS_ACTION_ATTR_TUNNEL_POP
                         || type == OVS_ACTION_ATTR_USERSPACE)) {
             dp_packet_reset_cutlen(packet);
-            if (!may_steal) {
+            if (!should_steal) {
                 packet = clone = dp_packet_clone(packet);
             }
             dp_packet_set_size(packet, dp_packet_size(packet) - cutlen);
@@ -1271,12 +1269,15 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_PUSH_ETH:
     case OVS_ACTION_ATTR_POP_ETH:
     case OVS_ACTION_ATTR_CLONE:
-    case OVS_ACTION_ATTR_ENCAP_NSH:
-    case OVS_ACTION_ATTR_DECAP_NSH:
+    case OVS_ACTION_ATTR_PUSH_NSH:
+    case OVS_ACTION_ATTR_POP_NSH:
+    case OVS_ACTION_ATTR_CT_CLEAR:
     case OVS_ACTION_ATTR_UNSPEC:
+    case OVS_ACTION_ATTR_CHECK_PKT_LEN:
     case __OVS_ACTION_ATTR_MAX:
         OVS_NOT_REACHED();
     }
+    dp_packet_delete_batch(packets_, should_steal);
 }
 
 /* Executes 'execute' by performing most of the actions in userspace and
@@ -1314,10 +1315,10 @@ dpif_execute(struct dpif *dpif, struct dpif_execute *execute)
         struct dpif_op op;
 
         op.type = DPIF_OP_EXECUTE;
-        op.u.execute = *execute;
+        op.execute = *execute;
 
         opp = &op;
-        dpif_operate(dpif, &opp, 1);
+        dpif_operate(dpif, &opp, 1, DPIF_OFFLOAD_AUTO);
 
         return op.error;
     } else {
@@ -1328,10 +1329,21 @@ dpif_execute(struct dpif *dpif, struct dpif_execute *execute)
 /* Executes each of the 'n_ops' operations in 'ops' on 'dpif', in the order in
  * which they are specified.  Places each operation's results in the "output"
  * members documented in comments, and 0 in the 'error' member on success or a
- * positive errno on failure. */
+ * positive errno on failure.
+ */
 void
-dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
+dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops,
+             enum dpif_offload_type offload_type)
 {
+    if (offload_type == DPIF_OFFLOAD_ALWAYS && !netdev_is_flow_api_enabled()) {
+        size_t i;
+        for (i = 0; i < n_ops; i++) {
+            struct dpif_op *op = ops[i];
+            op->error = EINVAL;
+        }
+        return;
+    }
+
     while (n_ops > 0) {
         size_t chunk;
 
@@ -1342,7 +1354,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
             struct dpif_op *op = ops[chunk];
 
             if (op->type == DPIF_OP_EXECUTE
-                && dpif_execute_needs_help(&op->u.execute)) {
+                && dpif_execute_needs_help(&op->execute)) {
                 break;
             }
         }
@@ -1352,7 +1364,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
              * handle itself, without help. */
             size_t i;
 
-            dpif->dpif_class->operate(dpif, ops, chunk);
+            dpif->dpif_class->operate(dpif, ops, chunk, offload_type);
 
             for (i = 0; i < chunk; i++) {
                 struct dpif_op *op = ops[i];
@@ -1360,7 +1372,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
 
                 switch (op->type) {
                 case DPIF_OP_FLOW_PUT: {
-                    struct dpif_flow_put *put = &op->u.flow_put;
+                    struct dpif_flow_put *put = &op->flow_put;
 
                     COVERAGE_INC(dpif_flow_put);
                     log_flow_put_message(dpif, &this_module, put, error);
@@ -1371,7 +1383,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
                 }
 
                 case DPIF_OP_FLOW_GET: {
-                    struct dpif_flow_get *get = &op->u.flow_get;
+                    struct dpif_flow_get *get = &op->flow_get;
 
                     COVERAGE_INC(dpif_flow_get);
                     if (error) {
@@ -1383,7 +1395,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
                 }
 
                 case DPIF_OP_FLOW_DEL: {
-                    struct dpif_flow_del *del = &op->u.flow_del;
+                    struct dpif_flow_del *del = &op->flow_del;
 
                     COVERAGE_INC(dpif_flow_del);
                     log_flow_del_message(dpif, &this_module, del, error);
@@ -1395,7 +1407,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
 
                 case DPIF_OP_EXECUTE:
                     COVERAGE_INC(dpif_execute);
-                    log_execute_message(dpif, &this_module, &op->u.execute,
+                    log_execute_message(dpif, &this_module, &op->execute,
                                         false, error);
                     break;
                 }
@@ -1408,7 +1420,7 @@ dpif_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
             struct dpif_op *op = ops[0];
 
             COVERAGE_INC(dpif_execute);
-            op->error = dpif_execute_with_help(dpif, &op->u.execute);
+            op->error = dpif_execute_with_help(dpif, &op->execute);
             ops++;
             n_ops--;
         }
@@ -1547,11 +1559,11 @@ dpif_set_config(struct dpif *dpif, const struct smap *cfg)
     return error;
 }
 
-/* Polls for an upcall from 'dpif' for an upcall handler.  Since there
- * there can be multiple poll loops, 'handler_id' is needed as index to
- * identify the corresponding poll loop.  If successful, stores the upcall
- * into '*upcall', using 'buf' for storage.  Should only be called if
- * 'recv_set' has been used to enable receiving packets from 'dpif'.
+/* Polls for an upcall from 'dpif' for an upcall handler.  Since there can
+ * be multiple poll loops, 'handler_id' is needed as index to identify the
+ * corresponding poll loop.  If successful, stores the upcall into '*upcall',
+ * using 'buf' for storage.  Should only be called if 'recv_set' has been used
+ * to enable receiving packets from 'dpif'.
  *
  * 'upcall->key' and 'upcall->userdata' point into data in the caller-provided
  * 'buf', so their memory cannot be freed separately from 'buf'.
@@ -1878,27 +1890,41 @@ dpif_meter_get_features(const struct dpif *dpif,
     }
 }
 
-/* Adds or modifies meter identified by 'meter_id' in 'dpif'.  If '*meter_id'
- * is UINT32_MAX, adds a new meter, otherwise modifies an existing meter.
+/* Adds or modifies the meter in 'dpif' with the given 'meter_id' and
+ * the configuration in 'config'.
  *
- * If meter is successfully added, sets '*meter_id' to the new meter's
- * meter number. */
+ * The meter id specified through 'config->meter_id' is ignored. */
 int
-dpif_meter_set(struct dpif *dpif, ofproto_meter_id *meter_id,
+dpif_meter_set(struct dpif *dpif, ofproto_meter_id meter_id,
                struct ofputil_meter_config *config)
 {
-    int error;
-
     COVERAGE_INC(dpif_meter_set);
 
-    error = dpif->dpif_class->meter_set(dpif, meter_id, config);
+    if (!(config->flags & (OFPMF13_KBPS | OFPMF13_PKTPS))) {
+        return EBADF; /* Rate unit type not set. */
+    }
+
+    if ((config->flags & OFPMF13_KBPS) && (config->flags & OFPMF13_PKTPS)) {
+        return EBADF; /* Both rate units may not be set. */
+    }
+
+    if (config->n_bands == 0) {
+        return EINVAL;
+    }
+
+    for (size_t i = 0; i < config->n_bands; i++) {
+        if (config->bands[i].rate == 0) {
+            return EDOM; /* Rate must be non-zero */
+        }
+    }
+
+    int error = dpif->dpif_class->meter_set(dpif, meter_id, config);
     if (!error) {
         VLOG_DBG_RL(&dpmsg_rl, "%s: DPIF meter %"PRIu32" set",
-                    dpif_name(dpif), meter_id->uint32);
+                    dpif_name(dpif), meter_id.uint32);
     } else {
         VLOG_WARN_RL(&error_rl, "%s: failed to set DPIF meter %"PRIu32": %s",
-                     dpif_name(dpif), meter_id->uint32, ovs_strerror(error));
-        meter_id->uint32 = UINT32_MAX;
+                     dpif_name(dpif), meter_id.uint32, ovs_strerror(error));
     }
     return error;
 }

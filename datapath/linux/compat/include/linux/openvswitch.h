@@ -238,6 +238,9 @@ enum ovs_vport_type {
 	OVS_VPORT_TYPE_GENEVE,	 /* Geneve tunnel. */
 	OVS_VPORT_TYPE_LISP = 105,  /* LISP tunnel */
 	OVS_VPORT_TYPE_STT = 106, /* STT tunnel */
+	OVS_VPORT_TYPE_ERSPAN = 107, /* ERSPAN tunnel. */
+	OVS_VPORT_TYPE_IP6ERSPAN = 108, /* ERSPAN tunnel. */
+	OVS_VPORT_TYPE_IP6GRE = 109,
 	__OVS_VPORT_TYPE_MAX
 };
 
@@ -283,6 +286,8 @@ enum ovs_vport_attr {
 				/* receiving upcalls */
 	OVS_VPORT_ATTR_STATS,	/* struct ovs_vport_stats */
 	OVS_VPORT_ATTR_PAD,
+	OVS_VPORT_ATTR_IFINDEX,
+	OVS_VPORT_ATTR_NETNSID,
 	__OVS_VPORT_ATTR_MAX
 };
 
@@ -360,6 +365,7 @@ enum ovs_key_attr {
 	OVS_KEY_ATTR_CT_LABELS,	/* 16-octet connection tracking labels */
 	OVS_KEY_ATTR_CT_ORIG_TUPLE_IPV4,   /* struct ovs_key_ct_tuple_ipv4 */
 	OVS_KEY_ATTR_CT_ORIG_TUPLE_IPV6,   /* struct ovs_key_ct_tuple_ipv6 */
+	OVS_KEY_ATTR_NSH,       /* Nested set of ovs_nsh_key_* */
 
 #ifdef __KERNEL__
 	/* Only used within kernel data path. */
@@ -369,7 +375,7 @@ enum ovs_key_attr {
 #ifndef __KERNEL__
 	/* Only used within userspace data path. */
 	OVS_KEY_ATTR_PACKET_TYPE,  /* be32 packet type */
-	OVS_KEY_ATTR_NSH,	   /* struct ovs_key_nsh */
+	OVS_KEY_ATTR_ND_EXTENSIONS, /* struct ovs_key_nd_extensions */
 #endif
 
 	__OVS_KEY_ATTR_MAX
@@ -393,6 +399,7 @@ enum ovs_tunnel_key_attr {
 	OVS_TUNNEL_KEY_ATTR_IPV6_SRC,		/* struct in6_addr src IPv6 address. */
 	OVS_TUNNEL_KEY_ATTR_IPV6_DST,		/* struct in6_addr dst IPv6 address. */
 	OVS_TUNNEL_KEY_ATTR_PAD,
+	OVS_TUNNEL_KEY_ATTR_ERSPAN_OPTS,	/* struct erspan_metadata */
 	__OVS_TUNNEL_KEY_ATTR_MAX
 };
 
@@ -483,6 +490,13 @@ struct ovs_key_nd {
 	__u8	nd_tll[ETH_ALEN];
 };
 
+#ifndef __KERNEL__
+struct ovs_key_nd_extensions {
+    __be32  nd_reserved;
+    __u8    nd_options_type;
+};
+#endif
+
 #define OVS_CT_LABELS_LEN_32	4
 #define OVS_CT_LABELS_LEN	(OVS_CT_LABELS_LEN_32 * sizeof(__u32))
 struct ovs_key_ct_labels {
@@ -492,13 +506,28 @@ struct ovs_key_ct_labels {
 	};
 };
 
-struct ovs_key_nsh {
-    __u8 flags;
-    __u8 mdtype;
-    __u8 np;
-    __u8 pad;
-    __be32 path_hdr;
-    __be32 c[4];
+enum ovs_nsh_key_attr {
+	OVS_NSH_KEY_ATTR_UNSPEC,
+	OVS_NSH_KEY_ATTR_BASE,          /* struct ovs_nsh_key_base. */
+	OVS_NSH_KEY_ATTR_MD1,           /* struct ovs_nsh_key_md1. */
+	OVS_NSH_KEY_ATTR_MD2,           /* variable-length octets. */
+	__OVS_NSH_KEY_ATTR_MAX
+};
+
+#define OVS_NSH_KEY_ATTR_MAX (__OVS_NSH_KEY_ATTR_MAX - 1)
+
+struct ovs_nsh_key_base {
+	__u8 flags;
+	__u8 ttl;
+	__u8 mdtype;
+	__u8 np;
+	__be32 path_hdr;
+};
+
+#define NSH_MD1_CONTEXT_SIZE 4
+
+struct ovs_nsh_key_md1 {
+	__be32 context[NSH_MD1_CONTEXT_SIZE];
 };
 
 /* OVS_KEY_ATTR_CT_STATE flags */
@@ -703,6 +732,10 @@ struct ovs_action_push_vlan {
  */
 enum ovs_hash_alg {
 	OVS_HASH_ALG_L4,
+#ifndef __KERNEL__
+	OVS_HASH_ALG_SYM_L4,
+#endif
+	__OVS_HASH_MAX
 };
 
 /*
@@ -793,25 +826,6 @@ struct ovs_action_push_eth {
 	struct ovs_key_ethernet addresses;
 };
 
-#define OVS_ENCAP_NSH_MAX_MD_LEN 16
-/*
- * struct ovs_action_encap_nsh - %OVS_ACTION_ATTR_ENCAP_NSH
- * @flags: NSH header flags.
- * @mdtype: NSH metadata type.
- * @mdlen: Length of NSH metadata in bytes.
- * @np: NSH next_protocol: Inner packet type.
- * @path_hdr: NSH service path id and service index.
- * @metadata: NSH metadata for MD type 1 or 2
- */
-struct ovs_action_encap_nsh {
-    uint8_t flags;
-    uint8_t mdtype;
-    uint8_t mdlen;
-    uint8_t np;
-    __be32 path_hdr;
-    uint8_t metadata[OVS_ENCAP_NSH_MAX_MD_LEN];
-};
-
 /**
  * enum ovs_nat_attr - Attributes for %OVS_CT_ATTR_NAT.
  *
@@ -848,6 +862,41 @@ enum ovs_nat_attr {
 };
 
 #define OVS_NAT_ATTR_MAX (__OVS_NAT_ATTR_MAX - 1)
+
+/*
+ * enum ovs_check_pkt_len_attr - Attributes for %OVS_ACTION_ATTR_CHECK_PKT_LEN.
+ *
+ * @OVS_CHECK_PKT_LEN_ATTR_PKT_LEN: u16 Packet length to check for.
+ * @OVS_CHECK_PKT_LEN_ATTR_USERSPACE_COND: u8 comparison condition to send
+ * the packet to userspace. One of OVS_CHECK_PKT_LEN_COND_*.
+ * @OVS_CHECK_PKT_LEN_ATTR_USERPACE - Nested OVS_USERSPACE_ATTR_* actions.
+ */
+enum ovs_check_pkt_len_attr {
+	OVS_CHECK_PKT_LEN_ATTR_UNSPEC,
+	OVS_CHECK_PKT_LEN_ATTR_PKT_LEN,
+	OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER,
+	OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL,
+	__OVS_CHECK_PKT_LEN_ATTR_MAX,
+
+#ifdef __KERNEL__
+	OVS_CHECK_PKT_LEN_ATTR_ARG          /* struct check_pkt_len_arg  */
+#endif
+};
+
+#define OVS_CHECK_PKT_LEN_ATTR_MAX (__OVS_CHECK_PKT_LEN_ATTR_MAX - 1)
+
+#ifdef __KERNEL__
+struct check_pkt_len_arg {
+        u16 pkt_len;    /* Same value as OVS_CHECK_PKT_LEN_ATTR_PKT_LEN'. */
+        bool exec_for_greater;  /* When true, actions in IF_GREATE will
+                                 * not change flow keys. False otherwise.
+                                 */
+        bool exec_for_lesser_equal; /* When true, actions in IF_LESS_EQUAL
+                                     * will not change flow keys. False
+                                     * otherwise.
+                                     */
+};
+#endif
 
 /**
  * enum ovs_action_attr - Action types.
@@ -887,8 +936,9 @@ enum ovs_nat_attr {
  * @OVS_ACTION_ATTR_PUSH_ETH: Push a new outermost Ethernet header onto the
  * packet.
  * @OVS_ACTION_ATTR_POP_ETH: Pop the outermost Ethernet header off the packet.
- * @OVS_ACTION_ATTR_ENCAP_NSH: encap NSH action to push NSH header.
- * @OVS_ACTION_ATTR_DECAP_NSH: decap NSH action to remove NSH header.
+ * @OVS_ACTION_ATTR_CT_CLEAR: Clear conntrack state from the packet.
+ * @OVS_ACTION_ATTR_PUSH_NSH: push NSH header to the packet.
+ * @OVS_ACTION_ATTR_POP_NSH: pop the outermost NSH header off the packet.
  *
  * Only a single header can be set with a single %OVS_ACTION_ATTR_SET.  Not all
  * fields within a header are modifiable, e.g. the IPv4 protocol and fragment
@@ -902,6 +952,11 @@ enum ovs_nat_attr {
  * tunnel header.
  * @OVS_ACTION_ATTR_METER: Run packet through a meter, which may drop the
  * packet, or modify the packet (e.g., change the DSCP field).
+ * @OVS_ACTION_ATTR_CLONE: make a copy of the packet and execute a list of
+ * actions without affecting the original packet and key.
+ * @OVS_ACTION_ATTR_CHECK_PKT_LEN: Check the packet length and execute a set
+ * of actions if greater than the specified packet length, else execute
+ * another set of actions.
  */
 
 enum ovs_action_attr {
@@ -924,14 +979,16 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_TRUNC,        /* u32 struct ovs_action_trunc. */
 	OVS_ACTION_ATTR_PUSH_ETH,     /* struct ovs_action_push_eth. */
 	OVS_ACTION_ATTR_POP_ETH,      /* No argument. */
+	OVS_ACTION_ATTR_CT_CLEAR,     /* No argument. */
+	OVS_ACTION_ATTR_PUSH_NSH,     /* Nested OVS_NSH_KEY_ATTR_*. */
+	OVS_ACTION_ATTR_POP_NSH,      /* No argument. */
+	OVS_ACTION_ATTR_METER,        /* u32 meter number. */
+	OVS_ACTION_ATTR_CLONE,        /* Nested OVS_CLONE_ATTR_*.  */
+	OVS_ACTION_ATTR_CHECK_PKT_LEN, /* Nested OVS_CHECK_PKT_LEN_ATTR_*. */
 
 #ifndef __KERNEL__
 	OVS_ACTION_ATTR_TUNNEL_PUSH,   /* struct ovs_action_push_tnl*/
 	OVS_ACTION_ATTR_TUNNEL_POP,    /* u32 port number. */
-	OVS_ACTION_ATTR_CLONE,         /* Nested OVS_CLONE_ATTR_*.  */
-	OVS_ACTION_ATTR_METER,         /* u32 meter number. */
-	OVS_ACTION_ATTR_ENCAP_NSH,    /* struct ovs_action_encap_nsh. */
-	OVS_ACTION_ATTR_DECAP_NSH,    /* No argument. */
 #endif
 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
 				       * from userspace. */
@@ -944,5 +1001,89 @@ enum ovs_action_attr {
 };
 
 #define OVS_ACTION_ATTR_MAX (__OVS_ACTION_ATTR_MAX - 1)
+
+/* Meters. */
+#define OVS_METER_FAMILY  "ovs_meter"
+#define OVS_METER_MCGROUP "ovs_meter"
+#define OVS_METER_VERSION 0x1
+
+enum ovs_meter_cmd {
+	OVS_METER_CMD_UNSPEC,
+	OVS_METER_CMD_FEATURES,	/* Get features supported by the datapath. */
+	OVS_METER_CMD_SET,	/* Add or modify a meter. */
+	OVS_METER_CMD_DEL,	/* Delete a meter. */
+	OVS_METER_CMD_GET	/* Get meter stats. */
+};
+
+enum ovs_meter_attr {
+	OVS_METER_ATTR_UNSPEC,
+	OVS_METER_ATTR_ID,	/* u32 meter ID within datapath. */
+	OVS_METER_ATTR_KBPS,	/* No argument. If set, units in kilobits
+				 * per second. Otherwise, units in
+				 * packets per second.
+				 */
+	OVS_METER_ATTR_STATS,	/* struct ovs_flow_stats for the meter. */
+	OVS_METER_ATTR_BANDS,	/* Nested attributes for meter bands. */
+	OVS_METER_ATTR_USED,	/* u64 msecs last used in monotonic time. */
+	OVS_METER_ATTR_CLEAR,	/* Flag to clear stats, used. */
+	OVS_METER_ATTR_MAX_METERS, /* u32 number of meters supported. */
+	OVS_METER_ATTR_MAX_BANDS,  /* u32 max number of bands per meter. */
+	OVS_METER_ATTR_PAD,
+	__OVS_METER_ATTR_MAX
+};
+
+#define OVS_METER_ATTR_MAX (__OVS_METER_ATTR_MAX - 1)
+
+enum ovs_band_attr {
+	OVS_BAND_ATTR_UNSPEC,
+	OVS_BAND_ATTR_TYPE,	/* u32 OVS_METER_BAND_TYPE_* constant. */
+	OVS_BAND_ATTR_RATE,	/* u32 band rate in meter units (see above). */
+	OVS_BAND_ATTR_BURST,	/* u32 burst size in meter units. */
+	OVS_BAND_ATTR_STATS,	/* struct ovs_flow_stats for the band. */
+	__OVS_BAND_ATTR_MAX
+};
+
+#define OVS_BAND_ATTR_MAX (__OVS_BAND_ATTR_MAX - 1)
+
+enum ovs_meter_band_type {
+	OVS_METER_BAND_TYPE_UNSPEC,
+	OVS_METER_BAND_TYPE_DROP,   /* Drop exceeding packets. */
+	__OVS_METER_BAND_TYPE_MAX
+};
+
+#define OVS_METER_BAND_TYPE_MAX (__OVS_METER_BAND_TYPE_MAX - 1)
+
+/* Conntrack limit */
+#define OVS_CT_LIMIT_FAMILY  "ovs_ct_limit"
+#define OVS_CT_LIMIT_MCGROUP "ovs_ct_limit"
+#define OVS_CT_LIMIT_VERSION 0x1
+
+enum ovs_ct_limit_cmd {
+	OVS_CT_LIMIT_CMD_UNSPEC,
+	OVS_CT_LIMIT_CMD_SET,		/* Add or modify ct limit. */
+	OVS_CT_LIMIT_CMD_DEL,		/* Delete ct limit. */
+	OVS_CT_LIMIT_CMD_GET		/* Get ct limit. */
+};
+
+enum ovs_ct_limit_attr {
+	OVS_CT_LIMIT_ATTR_UNSPEC,
+	OVS_CT_LIMIT_ATTR_ZONE_LIMIT,	/* Nested struct ovs_zone_limit. */
+	__OVS_CT_LIMIT_ATTR_MAX
+};
+
+#define OVS_CT_LIMIT_ATTR_MAX (__OVS_CT_LIMIT_ATTR_MAX - 1)
+
+#define OVS_ZONE_LIMIT_DEFAULT_ZONE -1
+
+struct ovs_zone_limit {
+	int zone_id;
+	__u32 limit;
+	__u32 count;
+};
+
+#define OVS_CLONE_ATTR_EXEC      0   /* Specify an u32 value. When nonzero,
+				      * actions in clone will not change flow
+				      * keys. False otherwise.
+				      */
 
 #endif /* _LINUX_OPENVSWITCH_H */

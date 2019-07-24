@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <sys/wait.h>
+
 #include "command-line.h"
 #include "dp-packet.h"
 #include "fatal-signal.h"
@@ -30,8 +31,9 @@
 #include "ovn/actions.h"
 #include "ovn/expr.h"
 #include "ovn/lex.h"
-#include "ovn/lib/logical-fields.h"
-#include "ovn/lib/ovn-dhcp.h"
+#include "ovn/logical-fields.h"
+#include "ovn/lib/ovn-l7.h"
+#include "ovn/lib/extend-table.h"
 #include "ovs-thread.h"
 #include "ovstest.h"
 #include "openvswitch/shash.h"
@@ -154,7 +156,9 @@ create_symtab(struct shash *symtab)
 }
 
 static void
-create_dhcp_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts)
+create_gen_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts,
+                struct hmap *nd_ra_opts,
+                struct controller_event_options *event_opts)
 {
     hmap_init(dhcp_opts);
     dhcp_opt_add(dhcp_opts, "offerip", 0, "ipv4");
@@ -163,7 +167,7 @@ create_dhcp_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts)
     dhcp_opt_add(dhcp_opts, "dns_server", 6, "ipv4");
     dhcp_opt_add(dhcp_opts, "log_server", 7, "ipv4");
     dhcp_opt_add(dhcp_opts, "lpr_server",  9, "ipv4");
-    dhcp_opt_add(dhcp_opts, "domain", 15, "str");
+    dhcp_opt_add(dhcp_opts, "domain_name", 15, "str");
     dhcp_opt_add(dhcp_opts, "swap_server", 16, "ipv4");
     dhcp_opt_add(dhcp_opts, "policy_filter", 21, "ipv4");
     dhcp_opt_add(dhcp_opts, "router_solicitation",  32, "ipv4");
@@ -179,6 +183,10 @@ create_dhcp_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts)
     dhcp_opt_add(dhcp_opts, "tcp_ttl", 37, "uint8");
     dhcp_opt_add(dhcp_opts, "mtu", 26, "uint16");
     dhcp_opt_add(dhcp_opts, "lease_time",  51, "uint32");
+    dhcp_opt_add(dhcp_opts, "wpad", 252, "str");
+    dhcp_opt_add(dhcp_opts, "bootfile_name", 67, "str");
+    dhcp_opt_add(dhcp_opts, "path_prefix", 210, "str");
+    dhcp_opt_add(dhcp_opts, "tftp_server_address", 150, "ipv4");
 
     /* DHCPv6 options. */
     hmap_init(dhcpv6_opts);
@@ -186,6 +194,13 @@ create_dhcp_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts)
     dhcp_opt_add(dhcpv6_opts, "ia_addr",  5, "ipv6");
     dhcp_opt_add(dhcpv6_opts, "dns_server",  23, "ipv6");
     dhcp_opt_add(dhcpv6_opts, "domain_search",  24, "str");
+
+    /* IPv6 ND RA options. */
+    hmap_init(nd_ra_opts);
+    nd_ra_opts_init(nd_ra_opts);
+
+    /* OVN controller events options. */
+    controller_event_opts_init(event_opts);
 }
 
 static void
@@ -204,10 +219,24 @@ create_addr_sets(struct shash *addr_sets)
     };
     static const char *const addrs4[] = { NULL };
 
-    expr_addr_sets_add(addr_sets, "set1", addrs1, 3);
-    expr_addr_sets_add(addr_sets, "set2", addrs2, 3);
-    expr_addr_sets_add(addr_sets, "set3", addrs3, 3);
-    expr_addr_sets_add(addr_sets, "set4", addrs4, 0);
+    expr_const_sets_add(addr_sets, "set1", addrs1, 3, true);
+    expr_const_sets_add(addr_sets, "set2", addrs2, 3, true);
+    expr_const_sets_add(addr_sets, "set3", addrs3, 3, true);
+    expr_const_sets_add(addr_sets, "set4", addrs4, 0, true);
+}
+
+static void
+create_port_groups(struct shash *port_groups)
+{
+    shash_init(port_groups);
+
+    static const char *const pg1[] = {
+        "lsp1", "lsp2", "lsp3",
+    };
+    static const char *const pg2[] = { NULL };
+
+    expr_const_sets_add(port_groups, "pg1", pg1, 3, false);
+    expr_const_sets_add(port_groups, "pg_empty", pg2, 0, false);
 }
 
 static bool
@@ -238,23 +267,29 @@ test_parse_expr__(int steps)
 {
     struct shash symtab;
     struct shash addr_sets;
+    struct shash port_groups;
     struct simap ports;
     struct ds input;
 
     create_symtab(&symtab);
     create_addr_sets(&addr_sets);
+    create_port_groups(&port_groups);
 
     simap_init(&ports);
     simap_put(&ports, "eth0", 5);
     simap_put(&ports, "eth1", 6);
     simap_put(&ports, "LOCAL", ofp_to_u16(OFPP_LOCAL));
+    simap_put(&ports, "lsp1", 0x11);
+    simap_put(&ports, "lsp2", 0x12);
+    simap_put(&ports, "lsp3", 0x13);
 
     ds_init(&input);
     while (!ds_get_test_line(&input, stdin)) {
         struct expr *expr;
         char *error;
 
-        expr = expr_parse_string(ds_cstr(&input), &symtab, &addr_sets, &error);
+        expr = expr_parse_string(ds_cstr(&input), &symtab, &addr_sets,
+                                 &port_groups, NULL, &error);
         if (!error && steps > 0) {
             expr = expr_annotate(expr, &symtab, &error);
         }
@@ -291,8 +326,10 @@ test_parse_expr__(int steps)
     simap_destroy(&ports);
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
-    expr_addr_sets_destroy(&addr_sets);
+    expr_const_sets_destroy(&addr_sets);
     shash_destroy(&addr_sets);
+    expr_const_sets_destroy(&port_groups);
+    shash_destroy(&port_groups);
 }
 
 static void
@@ -366,7 +403,7 @@ test_evaluate_expr(struct ovs_cmdl_context *ctx)
     ovn_init_symtab(&symtab);
 
     struct flow uflow;
-    char *error = expr_parse_microflow(ctx->argv[1], &symtab, NULL,
+    char *error = expr_parse_microflow(ctx->argv[1], &symtab, NULL, NULL,
                                        lookup_atoi_cb, NULL, &uflow);
     if (error) {
         ovs_fatal(0, "%s", error);
@@ -376,7 +413,8 @@ test_evaluate_expr(struct ovs_cmdl_context *ctx)
     while (!ds_get_test_line(&input, stdin)) {
         struct expr *expr;
 
-        expr = expr_parse_string(ds_cstr(&input), &symtab, NULL, &error);
+        expr = expr_parse_string(ds_cstr(&input), &symtab, NULL, NULL, NULL,
+                                 &error);
         if (!error) {
             expr = expr_annotate(expr, &symtab, &error);
         }
@@ -850,7 +888,8 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
             expr_format(expr, &s);
 
             char *error;
-            modified = expr_parse_string(ds_cstr(&s), symtab, NULL, &error);
+            modified = expr_parse_string(ds_cstr(&s), symtab, NULL,
+                                         NULL, NULL, &error);
             if (error) {
                 fprintf(stderr, "%s fails to parse (%s)\n",
                         ds_cstr(&s), error);
@@ -864,6 +903,7 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
 
             if (operation >= OP_NORMALIZE) {
                 modified = expr_normalize(modified);
+                ovs_assert(expr_honors_invariants(modified));
                 ovs_assert(expr_is_normalized(modified));
             }
         }
@@ -965,7 +1005,7 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
             struct test_rule *test_rule;
 
             CLS_FOR_EACH (test_rule, cr, &cls) {
-                classifier_remove(&cls, &test_rule->cr);
+                classifier_remove_assert(&cls, &test_rule->cr);
                 ovsrcu_postpone(free_rule, test_rule);
             }
             classifier_destroy(&cls);
@@ -1155,7 +1195,7 @@ test_expr_to_packets(struct ovs_cmdl_context *ctx OVS_UNUSED)
     while (!ds_get_test_line(&input, stdin)) {
         struct flow uflow;
         char *error = expr_parse_microflow(ds_cstr(&input), &symtab, NULL,
-                                           lookup_atoi_cb, NULL, &uflow);
+                                           NULL, lookup_atoi_cb, NULL, &uflow);
         if (error) {
             puts(error);
             free(error);
@@ -1165,7 +1205,7 @@ test_expr_to_packets(struct ovs_cmdl_context *ctx OVS_UNUSED)
         uint64_t packet_stub[128 / 8];
         struct dp_packet packet;
         dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
-        flow_compose(&packet, &uflow, 0);
+        flow_compose(&packet, &uflow, NULL, 64);
 
         struct ds output = DS_EMPTY_INITIALIZER;
         const uint8_t *buf = dp_packet_data(&packet);
@@ -1192,19 +1232,22 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
     struct shash symtab;
     struct hmap dhcp_opts;
     struct hmap dhcpv6_opts;
+    struct hmap nd_ra_opts;
+    struct controller_event_options event_opts;
     struct simap ports;
     struct ds input;
     bool ok = true;
 
     create_symtab(&symtab);
-    create_dhcp_opts(&dhcp_opts, &dhcpv6_opts);
+    create_gen_opts(&dhcp_opts, &dhcpv6_opts, &nd_ra_opts, &event_opts);
 
     /* Initialize group ids. */
-    struct group_table group_table;
-    group_table.group_ids = bitmap_allocate(MAX_OVN_GROUPS);
-    bitmap_set1(group_table.group_ids, 0); /* Group id 0 is invalid. */
-    hmap_init(&group_table.desired_groups);
-    hmap_init(&group_table.existing_groups);
+    struct ovn_extend_table group_table;
+    ovn_extend_table_init(&group_table);
+
+    /* Initialize meter ids for QoS. */
+    struct ovn_extend_table meter_table;
+    ovn_extend_table_init(&meter_table);
 
     simap_init(&ports);
     simap_put(&ports, "eth0", 5);
@@ -1225,6 +1268,8 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
             .symtab = &symtab,
             .dhcp_opts = &dhcp_opts,
             .dhcpv6_opts = &dhcpv6_opts,
+            .nd_ra_opts = &nd_ra_opts,
+            .controller_event_opts = &event_opts,
             .n_tables = 24,
             .cur_ltable = 10,
         };
@@ -1244,6 +1289,7 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
                 .aux = &ports,
                 .is_switch = true,
                 .group_table = &group_table,
+                .meter_table = &meter_table,
 
                 .pipeline = OVNACT_P_INGRESS,
                 .ingress_ptable = 8,
@@ -1255,7 +1301,8 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
             ofpbuf_init(&ofpacts, 0);
             ovnacts_encode(ovnacts.data, ovnacts.size, &ep, &ofpacts);
             struct ds ofpacts_s = DS_EMPTY_INITIALIZER;
-            ofpacts_format(ofpacts.data, ofpacts.size, NULL, &ofpacts_s);
+            struct ofpact_format_params fp = { .s = &ofpacts_s };
+            ofpacts_format(ofpacts.data, ofpacts.size, &fp);
             printf("    encodes as %s\n", ds_cstr(&ofpacts_s));
             ds_destroy(&ofpacts_s);
             ofpbuf_uninit(&ofpacts);
@@ -1309,7 +1356,10 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
     shash_destroy(&symtab);
     dhcp_opts_destroy(&dhcp_opts);
     dhcp_opts_destroy(&dhcpv6_opts);
-
+    nd_ra_opts_destroy(&nd_ra_opts);
+    controller_event_opts_destroy(&event_opts);
+    ovn_extend_table_destroy(&group_table);
+    ovn_extend_table_destroy(&meter_table);
     exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 

@@ -37,7 +37,7 @@
 #include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "process.h"
 #include "stream.h"
 #include "stream-ssl.h"
@@ -65,7 +65,7 @@ static bool oneline;
 static bool dry_run;
 
 /* --timeout: Time to wait for a connection to 'db'. */
-static int timeout;
+static unsigned int timeout;
 
 /* Format for table output. */
 static struct table_style table_style = TABLE_STYLE_DEFAULT;
@@ -82,7 +82,7 @@ OVS_NO_RETURN static void usage(void);
 static void parse_options(int argc, char *argv[], struct shash *local_options);
 static void run_prerequisites(struct ctl_command[], size_t n_commands,
                               struct ovsdb_idl *);
-static void do_vtep_ctl(const char *args, struct ctl_command *, size_t n,
+static bool do_vtep_ctl(const char *args, struct ctl_command *, size_t n,
                         struct ovsdb_idl *);
 static struct vtep_ctl_lswitch *find_lswitch(struct vtep_ctl_context *,
                                              const char *name,
@@ -99,7 +99,6 @@ main(int argc, char *argv[])
     struct shash local_options;
     unsigned int seqno;
     size_t n_commands;
-    char *args;
 
     set_program_name(argv[0]);
     fatal_ignore_sigpipe();
@@ -108,19 +107,19 @@ main(int argc, char *argv[])
 
     vtep_ctl_cmd_init();
 
-    /* Log our arguments.  This is often valuable for debugging systems. */
-    args = process_escape_args(argv);
-    VLOG(ctl_might_write_to_db(argv) ? VLL_INFO : VLL_DBG, "Called as %s", args);
-
     /* Parse command line. */
+    char *args = process_escape_args(argv);
     shash_init(&local_options);
     parse_options(argc, argv, &local_options);
-    commands = ctl_parse_commands(argc - optind, argv + optind, &local_options,
-                                  &n_commands);
-
-    if (timeout) {
-        time_alarm(timeout);
+    char *error = ctl_parse_commands(argc - optind, argv + optind,
+                                     &local_options, &commands, &n_commands);
+    if (error) {
+        ctl_fatal("%s", error);
     }
+    VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
+         "Called as %s", args);
+
+    ctl_timeout_setup(timeout);
 
     /* Initialize IDL. */
     idl = the_idl = ovsdb_idl_create(db, &vteprec_idl_class, false, false);
@@ -144,7 +143,10 @@ main(int argc, char *argv[])
 
         if (seqno != ovsdb_idl_get_seqno(idl)) {
             seqno = ovsdb_idl_get_seqno(idl);
-            do_vtep_ctl(args, commands, n_commands, idl);
+            if (do_vtep_ctl(args, commands, n_commands, idl)) {
+                free(args);
+                exit(EXIT_SUCCESS);
+            }
         }
 
         if (seqno == ovsdb_idl_get_seqno(idl)) {
@@ -248,10 +250,8 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             exit(EXIT_SUCCESS);
 
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout < 0) {
-                ctl_fatal("value %s on -t or --timeout is invalid",
-                          optarg);
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
+                ctl_fatal("value %s on -t or --timeout is invalid", optarg);
             }
             break;
 
@@ -313,6 +313,7 @@ VTEP commands:\n\
 Manager commands:\n\
   get-manager                 print the managers\n\
   del-manager                 delete the managers\n\
+  [--inactivity-probe=MSECS]\n\
   set-manager TARGET...       set the list of managers to TARGET...\n\
 \n\
 Physical Switch commands:\n\
@@ -358,6 +359,7 @@ MAC binding commands:\n\
   list-remote-macs LS                 list remote mac entries\n\
 \n\
 %s\
+%s\
 \n\
 Options:\n\
   --db=DATABASE               connect to DATABASE\n\
@@ -365,7 +367,8 @@ Options:\n\
   -t, --timeout=SECS          wait at most SECS seconds\n\
   --dry-run                   do not commit changes to database\n\
   --oneline                   print exactly one line of output per command\n",
-           program_name, program_name, ctl_get_db_cmd_usage(), ctl_default_db());
+           program_name, program_name, ctl_get_db_cmd_usage(),
+           ctl_list_db_tables_usage(), ctl_default_db());
     table_usage();
     vlog_usage();
     printf("\
@@ -2092,6 +2095,7 @@ pre_manager(struct ctl_context *ctx)
 {
     ovsdb_idl_add_column(ctx->idl, &vteprec_global_col_managers);
     ovsdb_idl_add_column(ctx->idl, &vteprec_manager_col_target);
+    ovsdb_idl_add_column(ctx->idl, &vteprec_manager_col_inactivity_probe);
 }
 
 static void
@@ -2144,10 +2148,13 @@ cmd_del_manager(struct ctl_context *ctx)
 }
 
 static void
-insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[], size_t n)
+insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[],
+                size_t n, struct shash *options)
 {
     struct vteprec_manager **managers;
     size_t i;
+    const char *inactivity_probe = shash_find_data(options,
+                                                   "--inactivity-probe");
 
     /* Insert each manager in a new row in Manager table. */
     managers = xmalloc(n * sizeof *managers);
@@ -2157,6 +2164,10 @@ insert_managers(struct vtep_ctl_context *vtepctl_ctx, char *targets[], size_t n)
         }
         managers[i] = vteprec_manager_insert(vtepctl_ctx->base.txn);
         vteprec_manager_set_target(managers[i], targets[i]);
+        if (inactivity_probe) {
+            int64_t msecs = atoll(inactivity_probe);
+            vteprec_manager_set_inactivity_probe(managers[i], &msecs, 1);
+        }
     }
 
     /* Store uuids of new Manager rows in 'managers' column. */
@@ -2172,7 +2183,7 @@ cmd_set_manager(struct ctl_context *ctx)
 
     verify_managers(vtepctl_ctx->vtep_global);
     delete_managers(vtepctl_ctx);
-    insert_managers(vtepctl_ctx, &ctx->argv[1], n);
+    insert_managers(vtepctl_ctx, &ctx->argv[1], n, &ctx->options);
 }
 
 /* Parameter commands. */
@@ -2249,6 +2260,9 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
 
             vtep_ctl_context_init(&vtepctl_ctx, c, idl, NULL, NULL, NULL);
             (c->syntax->prerequisites)(&vtepctl_ctx.base);
+            if (vtepctl_ctx.base.error) {
+                ctl_fatal("%s", vtepctl_ctx.base.error);
+            }
             vtep_ctl_context_done(&vtepctl_ctx, c);
 
             ovs_assert(!c->output.string);
@@ -2257,7 +2271,7 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
     }
 }
 
-static void
+static bool
 do_vtep_ctl(const char *args, struct ctl_command *commands,
             size_t n_commands, struct ovsdb_idl *idl)
 {
@@ -2294,6 +2308,9 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
         if (c->syntax->run) {
             (c->syntax->run)(&vtepctl_ctx.base);
         }
+        if (vtepctl_ctx.base.error) {
+            ctl_fatal("%s", vtepctl_ctx.base.error);
+        }
         vtep_ctl_context_done_command(&vtepctl_ctx, c);
 
         if (vtepctl_ctx.base.try_again) {
@@ -2329,6 +2346,9 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
             if (c->syntax->postprocess) {
                 vtep_ctl_context_init(&vtepctl_ctx, c, idl, txn, vtep_global, symtab);
                 (c->syntax->postprocess)(&vtepctl_ctx.base);
+                if (vtepctl_ctx.base.error) {
+                    ctl_fatal("%s", vtepctl_ctx.base.error);
+                }
                 vtep_ctl_context_done(&vtepctl_ctx, c);
             }
         }
@@ -2405,7 +2425,7 @@ do_vtep_ctl(const char *args, struct ctl_command *commands,
 
     ovsdb_idl_destroy(idl);
 
-    exit(EXIT_SUCCESS);
+    return true;
 
 try_again:
     /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
@@ -2421,6 +2441,7 @@ try_again:
         free(c->table);
     }
     free(error);
+    return false;
 }
 
 static const struct ctl_command_syntax vtep_commands[] = {
@@ -2485,8 +2506,8 @@ static const struct ctl_command_syntax vtep_commands[] = {
     /* Manager commands. */
     {"get-manager", 0, 0, NULL, pre_manager, cmd_get_manager, NULL, "", RO},
     {"del-manager", 0, 0, NULL, pre_manager, cmd_del_manager, NULL, "", RW},
-    {"set-manager", 1, INT_MAX, NULL, pre_manager, cmd_set_manager, NULL, "",
-     RW},
+    {"set-manager", 1, INT_MAX, NULL, pre_manager, cmd_set_manager, NULL,
+     "--inactivity-probe=", RW},
 
     {NULL, 0, 0, NULL, NULL, NULL, NULL, NULL, RO},
 };
@@ -2495,6 +2516,7 @@ static const struct ctl_command_syntax vtep_commands[] = {
 static void
 vtep_ctl_cmd_init(void)
 {
-    ctl_init(vteprec_table_classes, tables, cmd_show_tables, vtep_ctl_exit);
+    ctl_init(&vteprec_idl_class, vteprec_table_classes, tables,
+             cmd_show_tables, vtep_ctl_exit);
     ctl_register_commands(vtep_commands);
 }

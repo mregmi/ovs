@@ -10,6 +10,7 @@ DOC_SOURCE = \
 	Documentation/intro/why-ovs.rst \
 	Documentation/intro/install/index.rst \
 	Documentation/intro/install/bash-completion.rst \
+	Documentation/intro/install/afxdp.rst \
 	Documentation/intro/install/debian.rst \
 	Documentation/intro/install/documentation.rst \
 	Documentation/intro/install/distributions.rst \
@@ -23,29 +24,52 @@ DOC_SOURCE = \
 	Documentation/intro/install/windows.rst \
 	Documentation/intro/install/xenserver.rst \
 	Documentation/tutorials/index.rst \
+	Documentation/tutorials/faucet.rst \
 	Documentation/tutorials/ovs-advanced.rst \
 	Documentation/tutorials/ovn-openstack.rst \
 	Documentation/tutorials/ovn-sandbox.rst \
+	Documentation/tutorials/ovs-conntrack.rst \
+	Documentation/tutorials/ipsec.rst \
+	Documentation/tutorials/ovn-ipsec.rst \
+	Documentation/tutorials/ovn-rbac.rst \
 	Documentation/topics/index.rst \
 	Documentation/topics/bonding.rst \
 	Documentation/topics/idl-compound-indexes.rst \
 	Documentation/topics/datapath.rst \
 	Documentation/topics/design.rst \
 	Documentation/topics/dpdk/index.rst \
+	Documentation/topics/dpdk/bridge.rst \
+	Documentation/topics/dpdk/jumbo-frames.rst \
+	Documentation/topics/dpdk/memory.rst \
+	Documentation/topics/dpdk/pdump.rst \
+	Documentation/topics/dpdk/phy.rst \
+	Documentation/topics/dpdk/pmd.rst \
+	Documentation/topics/dpdk/qos.rst \
 	Documentation/topics/dpdk/ring.rst \
+	Documentation/topics/dpdk/vdev.rst \
 	Documentation/topics/dpdk/vhost-user.rst \
+	Documentation/topics/fuzzing/index.rst \
+	Documentation/topics/fuzzing/what-is-fuzzing.rst \
+	Documentation/topics/fuzzing/ovs-fuzzing-infrastructure.rst \
+	Documentation/topics/fuzzing/ovs-fuzzers.rst \
+	Documentation/topics/fuzzing/security-analysis-of-ovs-fuzzers.rst \
 	Documentation/topics/testing.rst \
 	Documentation/topics/high-availability.rst \
 	Documentation/topics/integration.rst \
 	Documentation/topics/language-bindings.rst \
+	Documentation/topics/networking-namespaces.rst \
 	Documentation/topics/openflow.rst \
+	Documentation/topics/ovn-news-2.8.rst \
 	Documentation/topics/ovsdb-replication.rst \
 	Documentation/topics/porting.rst \
+	Documentation/topics/role-based-access-control.rst \
 	Documentation/topics/tracing.rst \
 	Documentation/topics/windows.rst \
 	Documentation/howto/index.rst \
 	Documentation/howto/docker.rst \
 	Documentation/howto/dpdk.rst \
+	Documentation/howto/firewalld.rst \
+	Documentation/howto/ipsec.rst \
 	Documentation/howto/kvm.rst \
 	Documentation/howto/libvirt.rst \
 	Documentation/howto/selinux.rst \
@@ -70,6 +94,7 @@ DOC_SOURCE = \
 	Documentation/faq/general.rst \
 	Documentation/faq/issues.rst \
 	Documentation/faq/openflow.rst \
+	Documentation/faq/ovn.rst \
 	Documentation/faq/qos.rst \
 	Documentation/faq/releases.rst \
 	Documentation/faq/terminology.rst \
@@ -78,6 +103,8 @@ DOC_SOURCE = \
 	Documentation/internals/index.rst \
 	Documentation/internals/authors.rst \
 	Documentation/internals/bugs.rst \
+	Documentation/internals/charter.rst \
+	Documentation/internals/committer-emeritus-status.rst \
 	Documentation/internals/committer-grant-revocation.rst \
 	Documentation/internals/committer-responsibilities.rst \
 	Documentation/internals/documentation.rst \
@@ -94,7 +121,7 @@ DOC_SOURCE = \
 	Documentation/internals/contributing/libopenvswitch-abi.rst \
 	Documentation/internals/contributing/submitting-patches.rst \
 	Documentation/requirements.txt \
-	$(addprefix Documentation/ref/,$(RST_MANPAGES))
+	$(addprefix Documentation/ref/,$(RST_MANPAGES) $(RST_MANPAGES_NOINST))
 FLAKE8_PYFILES += Documentation/conf.py
 EXTRA_DIST += $(DOC_SOURCE)
 
@@ -139,7 +166,15 @@ endif
 # rST formatted manpages under Documentation/ref.
 RST_MANPAGES = \
 	ovs-test.8.rst \
-	ovs-vlan-test.8.rst
+	ovs-vlan-test.8.rst \
+	ovsdb-server.7.rst \
+	ovsdb.5.rst \
+	ovsdb.7.rst
+
+# rST formatted manpages that we don't want to install because they
+# document stuff that only works with a build tree, not with an
+# installed OVS.
+RST_MANPAGES_NOINST = ovs-sim.1.rst
 
 # The GNU standards say that these variables should control
 # installation directories for manpages in each section.  Automake
@@ -178,17 +213,20 @@ extract_stem_and_section = \
 	eval "mandir=\$$man$${section}dir"; \
 	test -n "$$mandir" || { echo "unknown directory for manpage section $$section"; continue; }
 
-if HAVE_SPHINX
 INSTALL_DATA_LOCAL += install-man-rst
+if HAVE_SPHINX
 install-man-rst: docs-check
 	@$(set_mandirs); \
-	for rst in $(RST_MANPAGES); do \
+	for rst in $(RST_MANPAGES) $(EXTRA_RST_MANPAGES); do \
 	    $(extract_stem_and_section); \
 	    echo " $(MKDIR_P) '$(DESTDIR)'\"$$mandir\""; \
 	    $(MKDIR_P) '$(DESTDIR)'"$$mandir"; \
 	    echo " $(INSTALL_DATA) $(SPHINXBUILDDIR)/man/$$stem.$$section '$(DESTDIR)'\"$$mandir/$$stem.$$section\""; \
 	    $(INSTALL_DATA) $(SPHINXBUILDDIR)/man/$$stem.$$section '$(DESTDIR)'"$$mandir/$$stem.$$section"; \
 	done
+else
+install-man-rst:
+	@:
 endif
 
 UNINSTALL_LOCAL += uninstall-man-rst

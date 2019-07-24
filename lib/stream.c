@@ -18,6 +18,7 @@
 #include "stream-provider.h"
 #include <errno.h>
 #include <inttypes.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdlib.h>
@@ -34,7 +35,7 @@
 #include "openvswitch/vlog.h"
 #include "ovs-thread.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "socket-util.h"
 #include "util.h"
@@ -125,11 +126,11 @@ stream_usage(const char *name, bool active, bool passive,
     printf("\n");
     if (active) {
         printf("Active %s connection methods:\n", name);
-        printf("  tcp:IP:PORT             "
-               "PORT at remote IP\n");
+        printf("  tcp:HOST:PORT           "
+               "PORT at remote HOST\n");
 #ifdef HAVE_OPENSSL
-        printf("  ssl:IP:PORT             "
-               "SSL PORT at remote IP\n");
+        printf("  ssl:HOST:PORT           "
+               "SSL PORT at remote HOST\n");
 #endif
         printf("  unix:FILE               "
                "Unix domain socket named FILE\n");
@@ -240,27 +241,39 @@ error:
 }
 
 /* Blocks until a previously started stream connection attempt succeeds or
- * fails.  'error' should be the value returned by stream_open() and 'streamp'
- * should point to the stream pointer set by stream_open().  Returns 0 if
- * successful, otherwise a positive errno value other than EAGAIN or
- * EINPROGRESS.  If successful, leaves '*streamp' untouched; on error, closes
- * '*streamp' and sets '*streamp' to null.
+ * fails, but no more than 'timeout' milliseconds.  'error' should be the
+ * value returned by stream_open() and 'streamp' should point to the stream
+ * pointer set by stream_open().  Returns 0 if successful, otherwise a
+ * positive errno value other than EAGAIN or EINPROGRESS.  If successful,
+ * leaves '*streamp' untouched; on error, closes '*streamp' and sets
+ * '*streamp' to null. Negative value of 'timeout' means infinite waiting.
  *
  * Typical usage:
- *   error = stream_open_block(stream_open("tcp:1.2.3.4:5", &stream), &stream);
+ *   error = stream_open_block(stream_open("tcp:1.2.3.4:5", &stream), -1,
+ *                             &stream);
  */
 int
-stream_open_block(int error, struct stream **streamp)
+stream_open_block(int error, long long int timeout, struct stream **streamp)
 {
     struct stream *stream = *streamp;
 
     fatal_signal_run();
 
     if (!error) {
+        long long int deadline = (timeout >= 0
+                                  ? time_msec() + timeout
+                                  : LLONG_MAX);
         while ((error = stream_connect(stream)) == EAGAIN) {
+            if (deadline != LLONG_MAX && time_msec() > deadline) {
+                error = ETIMEDOUT;
+                break;
+            }
             stream_run(stream);
             stream_run_wait(stream);
             stream_connect_wait(stream);
+            if (deadline != LLONG_MAX) {
+                poll_timer_wait_until(deadline);
+            }
             poll_block();
         }
         ovs_assert(error != EINPROGRESS);
@@ -746,12 +759,11 @@ pstream_open_with_default_port(const char *name_,
  *     - On error, function returns false and *ss contains garbage.
  */
 bool
-stream_parse_target_with_default_port(const char *target,
-                                      uint16_t default_port,
+stream_parse_target_with_default_port(const char *target, int default_port,
                                       struct sockaddr_storage *ss)
 {
     return ((!strncmp(target, "tcp:", 4) || !strncmp(target, "ssl:", 4))
-            && inet_parse_active(target + 4, default_port, ss));
+            && inet_parse_active(target + 4, default_port, ss, true));
 }
 
 /* Attempts to guess the content type of a stream whose first few bytes were

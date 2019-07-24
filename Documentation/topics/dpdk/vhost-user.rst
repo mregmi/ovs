@@ -29,6 +29,11 @@ The DPDK datapath provides DPDK-backed vHost user ports as a primary way to
 interact with guests. For more information on vHost User, refer to the `QEMU
 documentation`_ on same.
 
+.. important::
+
+   To use any DPDK-backed interface, you must ensure your bridge is configured
+   correctly. For more information, refer to :doc:`bridge`.
+
 Quick Example
 -------------
 
@@ -105,6 +110,10 @@ Once the vhost-user ports have been added to the switch, they must be added to
 the guest. There are two ways to do this: using QEMU directly, or using
 libvirt.
 
+.. note::
+
+   IOMMU and Post-copy Live Migration are not supported with vhost-user ports.
+
 Adding vhost-user ports to the guest (QEMU)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -127,11 +136,10 @@ an additional set of parameters::
     -netdev type=vhost-user,id=mynet2,chardev=char2,vhostforce
     -device virtio-net-pci,mac=00:00:00:00:00:02,netdev=mynet2
 
-In addition,       QEMU must allocate the VM's memory on hugetlbfs. vhost-user
-ports access a virtio-net device's virtual rings and packet buffers mapping the
-VM's physical memory on hugetlbfs. To enable vhost-user ports to map the VM's
-memory into their process address space, pass the following parameters to
-QEMU::
+In addition, QEMU must allocate the VM's memory on hugetlbfs. vhost-user ports
+access a virtio-net device's virtual rings and packet buffers mapping the VM's
+physical memory on hugetlbfs. To enable vhost-user ports to map the VM's memory
+into their process address space, pass the following parameters to QEMU::
 
     -object memory-backend-file,id=mem,size=4096M,mem-path=/dev/hugepages,share=on
     -numa node,memdev=mem -mem-prealloc
@@ -151,18 +159,18 @@ where:
   The number of vectors, which is ``$q`` * 2 + 2
 
 The vhost-user interface will be automatically reconfigured with required
-number of rx and tx queues after connection of virtio device.  Manual
+number of Rx and Tx queues after connection of virtio device.  Manual
 configuration of ``n_rxq`` is not supported because OVS will work properly only
 if ``n_rxq`` will match number of queues configured in QEMU.
 
-A least 2 PMDs should be configured for the vswitch when using multiqueue.
+A least two PMDs should be configured for the vswitch when using multiqueue.
 Using a single PMD will cause traffic to be enqueued to the same vhost queue
 rather than being distributed among different vhost queues for a vhost-user
 interface.
 
 If traffic destined for a VM configured with multiqueue arrives to the vswitch
-via a physical DPDK port, then the number of rxqs should also be set to at
-least 2 for that physical DPDK port. This is required to increase the
+via a physical DPDK port, then the number of Rx queues should also be set to at
+least two for that physical DPDK port. This is required to increase the
 probability that a different PMD will handle the multiqueue transmission to the
 guest using a different vhost queue.
 
@@ -184,20 +192,13 @@ where:
 Adding vhost-user ports to the guest (libvirt)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. TODO(stephenfin): This seems like something that wouldn't be acceptable in
-   production. Is this really required?
-
-To begin, you must change the user and group that libvirt runs under, configure
-access control policy and restart libvirtd.
+To begin, you must change the user and group that qemu runs under, and restart
+libvirtd.
 
 - In ``/etc/libvirt/qemu.conf`` add/edit the following lines::
 
       user = "root"
       group = "root"
-
-- Disable SELinux or set to permissive mode::
-
-      $ setenforce 0
 
 - Finally, restart the libvirtd process, For example, on Fedora::
 
@@ -273,7 +274,106 @@ One benefit of using this mode is the ability for vHost ports to 'reconnect' in
 event of the switch crashing or being brought down. Once it is brought back up,
 the vHost ports will reconnect automatically and normal service will resume.
 
+vhost-user-client IOMMU Support
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+vhost IOMMU is a feature which restricts the vhost memory that a virtio device
+can access, and as such is useful in deployments in which security is a
+concern.
+
+IOMMU support may be enabled via a global config value,
+```vhost-iommu-support```. Setting this to true enables vhost IOMMU support for
+all vhost ports when/where available::
+
+    $ ovs-vsctl set Open_vSwitch . other_config:vhost-iommu-support=true
+
+The default value is false.
+
+.. important::
+
+    Changing this value requires restarting the daemon.
+
+.. important::
+
+    Enabling the IOMMU feature also enables the vhost user reply-ack protocol;
+    this is known to work on QEMU v2.10.0, but is buggy on older versions
+    (2.7.0 - 2.9.0, inclusive). Consequently, the IOMMU feature is disabled by
+    default (and should remain so if using the aforementioned versions of
+    QEMU). Starting with QEMU v2.9.1, vhost-iommu-support can safely be
+    enabled, even without having an IOMMU device, with no performance penalty.
+
+vhost-user-client Post-copy Live Migration Support (experimental)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``Post-copy`` migration is the migration mode where the destination CPUs are
+started before all the memory has been transferred. The main advantage is the
+predictable migration time. Mostly used as a second phase after the normal
+'pre-copy' migration in case it takes too long to converge.
+
+More information can be found in QEMU `docs`_.
+
+.. _`docs`: https://git.qemu.org/?p=qemu.git;a=blob;f=docs/devel/migration.rst
+
+Post-copy support may be enabled via a global config value
+``vhost-postcopy-support``. Setting this to ``true`` enables Post-copy support
+for all vhost-user-client ports::
+
+    $ ovs-vsctl set Open_vSwitch . other_config:vhost-postcopy-support=true
+
+The default value is ``false``.
+
+.. important::
+
+    Changing this value requires restarting the daemon.
+
+.. important::
+
+    DPDK Post-copy migration mode uses userfaultfd syscall to communicate with
+    the kernel about page fault handling and uses shared memory based on huge
+    pages. So destination host linux kernel should support userfaultfd over
+    shared hugetlbfs. This feature only introduced in kernel upstream version
+    4.11.
+
+    Post-copy feature supported in DPDK since 18.11.0 version and in QEMU
+    since 2.12.0 version. But it's suggested to use QEMU >= 3.0.1 because
+    migration recovery was fixed for post-copy in 3.0 and few additional bug
+    fixes (like userfaulfd leak) was released in 3.0.1.
+
+    DPDK Post-copy feature requires avoiding to populate the guest memory
+    (application must not call mlock* syscall). So enabling mlockall and
+    dequeue zero-copy features is mis-compatible with post-copy feature.
+
+    Note that during migration of vhost-user device, PMD threads hang for the
+    time of faulted pages download from source host. Transferring 1GB hugepage
+    across a 10Gbps link possibly unacceptably slow. So recommended hugepage
+    size is 2MB.
+
 .. _dpdk-testpmd:
+
+vhost-user-client tx retries config
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For vhost-user-client interfaces, the max amount of retries can be changed from
+the default 8 by setting ``tx-retries-max``.
+
+The minimum is 0 which means there will be no retries and if any packets in
+each batch cannot be sent immediately they will be dropped. The maximum is 32,
+which would mean that after the first packet(s) in the batch was sent there
+could be a maximum of 32 more retries.
+
+Retries can help with avoiding packet loss when temporarily unable to send to a
+vhost interface because the virtqueue is full. However, spending more time
+retrying to send to one interface, will reduce the time available for rx/tx and
+processing packets on other interfaces, so some tuning may be required for best
+performance.
+
+Tx retries max can be set for vhost-user-client ports::
+
+    $ ovs-vsctl set Interface vhost-client-1 options:tx-retries-max=0
+
+.. note::
+
+  Configurable vhost tx retries are not supported with vhost-user ports.
 
 DPDK in the Guest
 -----------------
@@ -292,9 +392,9 @@ To begin, instantiate a guest as described in :ref:`dpdk-vhost-user` or
 DPDK sources to VM and build DPDK::
 
     $ cd /root/dpdk/
-    $ wget http://fast.dpdk.org/rel/dpdk-17.05.1.tar.xz
-    $ tar xf dpdk-17.05.1.tar.xz
-    $ export DPDK_DIR=/root/dpdk/dpdk-stable-17.05.1
+    $ wget http://fast.dpdk.org/rel/dpdk-18.11.2.tar.xz
+    $ tar xf dpdk-18.11.2.tar.xz
+    $ export DPDK_DIR=/root/dpdk/dpdk-stable-18.11.2
     $ export DPDK_TARGET=x86_64-native-linuxapp-gcc
     $ export DPDK_BUILD=$DPDK_DIR/$DPDK_TARGET
     $ cd $DPDK_DIR
@@ -370,24 +470,18 @@ Sample XML
       <on_reboot>restart</on_reboot>
       <on_crash>destroy</on_crash>
       <devices>
-        <emulator>/usr/bin/qemu-kvm</emulator>
+        <emulator>/usr/bin/qemu-system-x86_64</emulator>
         <disk type='file' device='disk'>
           <driver name='qemu' type='qcow2' cache='none'/>
           <source file='/root/CentOS7_x86_64.qcow2'/>
           <target dev='vda' bus='virtio'/>
-        </disk>
-        <disk type='dir' device='disk'>
-          <driver name='qemu' type='fat'/>
-          <source dir='/usr/src/dpdk-stable-17.05.1'/>
-          <target dev='vdb' bus='virtio'/>
-          <readonly/>
         </disk>
         <interface type='vhostuser'>
           <mac address='00:00:00:00:00:01'/>
           <source type='unix' path='/usr/local/var/run/openvswitch/dpdkvhostuser0' mode='client'/>
            <model type='virtio'/>
           <driver queues='2'>
-            <host mrg_rxbuf='off'/>
+            <host mrg_rxbuf='on'/>
           </driver>
         </interface>
         <interface type='vhostuser'>
@@ -395,7 +489,7 @@ Sample XML
           <source type='unix' path='/usr/local/var/run/openvswitch/dpdkvhostuser1' mode='client'/>
           <model type='virtio'/>
           <driver queues='2'>
-            <host mrg_rxbuf='off'/>
+            <host mrg_rxbuf='on'/>
           </driver>
         </interface>
         <serial type='pty'>
@@ -408,3 +502,124 @@ Sample XML
     </domain>
 
 .. _QEMU documentation: http://git.qemu-project.org/?p=qemu.git;a=blob;f=docs/specs/vhost-user.txt;h=7890d7169;hb=HEAD
+
+Jumbo Frames
+------------
+
+DPDK vHost User ports can be configured to use Jumbo Frames. For more
+information, refer to :doc:`jumbo-frames`.
+
+vhost tx retries
+----------------
+
+When sending a batch of packets to a vhost-user or vhost-user-client interface,
+it may happen that some but not all of the packets in the batch are able to be
+sent to the guest. This is often because there is not enough free descriptors
+in the virtqueue for all the packets in the batch to be sent. In this case
+there will be a retry, with a default maximum of 8 occurring. If at any time no
+packets can be sent, it may mean the guest is not accepting packets, so there
+are no (more) retries.
+
+For information about configuring the maximum amount of tx retries for
+vhost-user-client interfaces see `vhost-user-client tx retries config`_.
+
+.. note::
+
+  Maximum vhost tx batch size is defined by NETDEV_MAX_BURST, and is currently
+  as 32.
+
+Tx Retries may be reduced or even avoided by some external configuration, such
+as increasing the virtqueue size through the ``rx_queue_size`` parameter
+introduced in QEMU 2.7.0 / libvirt 2.3.0::
+
+  <interface type='vhostuser'>
+      <mac address='56:48:4f:53:54:01'/>
+      <source type='unix' path='/tmp/dpdkvhostclient0' mode='server'/>
+      <model type='virtio'/>
+      <driver name='vhost' rx_queue_size='1024' tx_queue_size='1024'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x10' function='0x0'/>
+  </interface>
+
+The guest application will also need need to provide enough descriptors. For
+example with ``testpmd`` the command line argument can be used::
+
+ --rxd=1024 --txd=1024
+
+The guest should also have sufficient cores dedicated for consuming and
+processing packets at the required rate.
+
+The amount of Tx retries on a vhost-user or vhost-user-client interface can be
+shown with::
+
+  $ ovs-vsctl get Interface dpdkvhostclient0 statistics:tx_retries
+
+vhost-user Dequeue Zero Copy (experimental)
+-------------------------------------------
+
+Normally when dequeuing a packet from a vHost User device, a memcpy operation
+must be used to copy that packet from guest address space to host address
+space. This memcpy can be removed by enabling dequeue zero-copy like so::
+
+    $ ovs-vsctl add-port br0 dpdkvhostuserclient0 -- set Interface \
+        dpdkvhostuserclient0 type=dpdkvhostuserclient \
+        options:vhost-server-path=/tmp/dpdkvhostclient0 \
+        options:dq-zero-copy=true
+
+With this feature enabled, a reference (pointer) to the packet is passed to
+the host, instead of a copy of the packet. Removing this memcpy can give a
+performance improvement for some use cases, for example switching large packets
+between different VMs. However additional packet loss may be observed.
+
+Note that the feature is disabled by default and must be explicitly enabled
+by setting the ``dq-zero-copy`` option to ``true`` while specifying the
+``vhost-server-path`` option as above. If you wish to split out the command
+into multiple commands as below, ensure ``dq-zero-copy`` is set before
+``vhost-server-path``::
+
+    $ ovs-vsctl set Interface dpdkvhostuserclient0 options:dq-zero-copy=true
+    $ ovs-vsctl set Interface dpdkvhostuserclient0 \
+        options:vhost-server-path=/tmp/dpdkvhostclient0
+
+The feature is only available to ``dpdkvhostuserclient`` port types.
+
+A limitation exists whereby if packets from a vHost port with
+``dq-zero-copy=true`` are destined for a ``dpdk`` type port, the number of tx
+descriptors (``n_txq_desc``) for that port must be reduced to a smaller number,
+128 being the recommended value. This can be achieved by issuing the following
+command::
+
+    $ ovs-vsctl set Interface dpdkport options:n_txq_desc=128
+
+Note: The sum of the tx descriptors of all ``dpdk`` ports the VM will send to
+should not exceed 128. For example, in case of a bond over two physical ports
+in balance-tcp mode, one must divide 128 by the number of links in the bond.
+
+Refer to :ref:`dpdk-queues-sizes` for more information.
+
+The reason for this limitation is due to how the zero copy functionality is
+implemented. The vHost device's 'tx used vring', a virtio structure used for
+tracking used ie. sent descriptors, will only be updated when the NIC frees
+the corresponding mbuf. If we don't free the mbufs frequently enough, that
+vring will be starved and packets will no longer be processed. One way to
+ensure we don't encounter this scenario, is to configure ``n_txq_desc`` to a
+small enough number such that the 'mbuf free threshold' for the NIC will be hit
+more often and thus free mbufs more frequently. The value of 128 is suggested,
+but values of 64 and 256 have been tested and verified to work too, with
+differing performance characteristics. A value of 512 can be used too, if the
+virtio queue size in the guest is increased to 1024 (available to configure in
+QEMU versions v2.10 and greater). This value can be set like so::
+
+    $ qemu-system-x86_64 ... -chardev socket,id=char1,path=<sockpath>,server
+      -netdev type=vhost-user,id=mynet1,chardev=char1,vhostforce
+      -device virtio-net-pci,mac=00:00:00:00:00:01,netdev=mynet1,
+      tx_queue_size=1024
+
+Because of this limitation, this feature is considered 'experimental'.
+
+.. note::
+
+   Post-copy Live Migration is not compatible with dequeue zero copy.
+
+Further information can be found in the
+`DPDK documentation
+<https://doc.dpdk.org/guides-18.11/prog_guide/vhost_lib.html>`__

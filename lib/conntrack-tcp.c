@@ -44,16 +44,16 @@
 #include "util.h"
 
 struct tcp_peer {
-    enum ct_dpif_tcp_state state;
     uint32_t               seqlo;          /* Max sequence number sent     */
     uint32_t               seqhi;          /* Max the other end ACKd + win */
     uint16_t               max_win;        /* largest window (pre scaling) */
     uint8_t                wscale;         /* window scaling factor        */
+    enum ct_dpif_tcp_state state;
 };
 
 struct conn_tcp {
     struct conn up;
-    struct tcp_peer peer[2];
+    struct tcp_peer peer[2]; /* 'conn' lock protected. */
 };
 
 enum {
@@ -145,7 +145,7 @@ tcp_get_wscale(const struct tcp_header *tcp)
 }
 
 static enum ct_update_res
-tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
+tcp_conn_update(struct conntrack *ct, struct conn *conn_,
                 struct dp_packet *pkt, bool reply, long long now)
 {
     struct conn_tcp *conn = conn_tcp_cast(conn_);
@@ -160,7 +160,6 @@ tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
     uint16_t win = ntohs(tcp->tcp_winsz);
     uint32_t ack, end, seq, orig_seq;
     uint32_t p_len = tcp_payload_length(pkt);
-    int ackskew;
 
     if (tcp_invalid_flags(tcp_flags)) {
         return CT_UPDATE_INVALID;
@@ -195,6 +194,7 @@ tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
      */
 
     orig_seq = seq = ntohl(get_16aligned_be32(&tcp->tcp_seq));
+    bool check_ackskew = true;
     if (src->state < CT_DPIF_TCPS_SYN_SENT) {
         /* First packet from this end. Set its state */
 
@@ -232,6 +232,11 @@ tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
         if (src->seqhi == 1
                 || SEQ_GEQ(end + MAX(1, dst->max_win << dws), src->seqhi)) {
             src->seqhi = end + MAX(1, dst->max_win << dws);
+            /* We are either picking up a new connection or a connection which
+             * was already in place.  We are more permissive in terms of
+             * ackskew checking in these cases.
+             */
+            check_ackskew = false;
         }
         if (win > src->max_win) {
             src->max_win = win;
@@ -265,7 +270,7 @@ tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
         end = seq;
     }
 
-    ackskew = dst->seqlo - ack;
+    int ackskew = check_ackskew ? dst->seqlo - ack : 0;
 #define MAXACKWINDOW (0xffff + 1500)    /* 1500 is an arbitrary fudge factor */
     if (SEQ_GEQ(src->seqhi, end)
         /* Last octet inside other's window space */
@@ -312,18 +317,18 @@ tcp_conn_update(struct conn *conn_, struct conntrack_bucket *ctb,
 
         if (src->state >= CT_DPIF_TCPS_FIN_WAIT_2
             && dst->state >= CT_DPIF_TCPS_FIN_WAIT_2) {
-            conn_update_expiration(ctb, &conn->up, CT_TM_TCP_CLOSED, now);
+            conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSED, now);
         } else if (src->state >= CT_DPIF_TCPS_CLOSING
                    && dst->state >= CT_DPIF_TCPS_CLOSING) {
-            conn_update_expiration(ctb, &conn->up, CT_TM_TCP_FIN_WAIT, now);
+            conn_update_expiration(ct, &conn->up, CT_TM_TCP_FIN_WAIT, now);
         } else if (src->state < CT_DPIF_TCPS_ESTABLISHED
                    || dst->state < CT_DPIF_TCPS_ESTABLISHED) {
-            conn_update_expiration(ctb, &conn->up, CT_TM_TCP_OPENING, now);
+            conn_update_expiration(ct, &conn->up, CT_TM_TCP_OPENING, now);
         } else if (src->state >= CT_DPIF_TCPS_CLOSING
                    || dst->state >= CT_DPIF_TCPS_CLOSING) {
-            conn_update_expiration(ctb, &conn->up, CT_TM_TCP_CLOSING, now);
+            conn_update_expiration(ct, &conn->up, CT_TM_TCP_CLOSING, now);
         } else {
-            conn_update_expiration(ctb, &conn->up, CT_TM_TCP_ESTABLISHED, now);
+            conn_update_expiration(ct, &conn->up, CT_TM_TCP_ESTABLISHED, now);
         }
     } else if ((dst->state < CT_DPIF_TCPS_SYN_SENT
                 || dst->state >= CT_DPIF_TCPS_FIN_WAIT_2
@@ -407,8 +412,7 @@ tcp_valid_new(struct dp_packet *pkt)
 }
 
 static struct conn *
-tcp_new_conn(struct conntrack_bucket *ctb, struct dp_packet *pkt,
-             long long now)
+tcp_new_conn(struct conntrack *ct, struct dp_packet *pkt, long long now)
 {
     struct conn_tcp* newconn = NULL;
     struct tcp_header *tcp = dp_packet_l4(pkt);
@@ -444,8 +448,7 @@ tcp_new_conn(struct conntrack_bucket *ctb, struct dp_packet *pkt,
     src->state = CT_DPIF_TCPS_SYN_SENT;
     dst->state = CT_DPIF_TCPS_CLOSED;
 
-    conn_init_expiration(ctb, &newconn->up, CT_TM_TCP_FIRST_PACKET,
-                         now);
+    conn_init_expiration(ct, &newconn->up, CT_TM_TCP_FIRST_PACKET, now);
 
     return &newconn->up;
 }

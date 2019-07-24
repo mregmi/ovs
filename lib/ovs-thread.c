@@ -27,9 +27,8 @@
 #include "fatal-signal.h"
 #include "hash.h"
 #include "openvswitch/list.h"
-#include "netdev-dpdk.h"
 #include "ovs-rcu.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
 #include "socket-util.h"
 #include "util.h"
@@ -76,6 +75,9 @@ static bool multithreaded;
 LOCK_FUNCTION(mutex, lock);
 LOCK_FUNCTION(rwlock, rdlock);
 LOCK_FUNCTION(rwlock, wrlock);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+LOCK_FUNCTION(spin, lock);
+#endif
 
 #define TRY_LOCK_FUNCTION(TYPE, FUN) \
     int \
@@ -104,6 +106,9 @@ LOCK_FUNCTION(rwlock, wrlock);
 TRY_LOCK_FUNCTION(mutex, trylock);
 TRY_LOCK_FUNCTION(rwlock, tryrdlock);
 TRY_LOCK_FUNCTION(rwlock, trywrlock);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+TRY_LOCK_FUNCTION(spin, trylock);
+#endif
 
 #define UNLOCK_FUNCTION(TYPE, FUN, WHERE) \
     void \
@@ -126,6 +131,10 @@ UNLOCK_FUNCTION(mutex, unlock, "<unlocked>");
 UNLOCK_FUNCTION(mutex, destroy, NULL);
 UNLOCK_FUNCTION(rwlock, unlock, "<unlocked>");
 UNLOCK_FUNCTION(rwlock, destroy, NULL);
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+UNLOCK_FUNCTION(spin, unlock, "<unlocked>");
+UNLOCK_FUNCTION(spin, destroy, NULL);
+#endif
 
 #define XPTHREAD_FUNC1(FUNCTION, PARAM1)                \
     void                                                \
@@ -155,8 +164,6 @@ UNLOCK_FUNCTION(rwlock, destroy, NULL);
         }                                               \
     }
 
-XPTHREAD_FUNC1(pthread_mutex_lock, pthread_mutex_t *);
-XPTHREAD_FUNC1(pthread_mutex_unlock, pthread_mutex_t *);
 XPTHREAD_FUNC1(pthread_mutexattr_init, pthread_mutexattr_t *);
 XPTHREAD_FUNC1(pthread_mutexattr_destroy, pthread_mutexattr_t *);
 XPTHREAD_FUNC2(pthread_mutexattr_settype, pthread_mutexattr_t *, int);
@@ -259,6 +266,7 @@ ovs_rwlock_init(const struct ovs_rwlock *l_)
  * call with calls to ovsrcu_quiesce_start() and ovsrcu_quiesce_end().  */
 void
 ovs_mutex_cond_wait(pthread_cond_t *cond, const struct ovs_mutex *mutex_)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct ovs_mutex *mutex = CONST_CAST(struct ovs_mutex *, mutex_);
     int error;
@@ -269,6 +277,27 @@ ovs_mutex_cond_wait(pthread_cond_t *cond, const struct ovs_mutex *mutex_)
         ovs_abort(error, "pthread_cond_wait failed");
     }
 }
+
+#ifdef HAVE_PTHREAD_SPIN_LOCK
+static void
+ovs_spin_init__(const struct ovs_spin *l_, int pshared)
+{
+    struct ovs_spin *l = CONST_CAST(struct ovs_spin *, l_);
+    int error;
+
+    l->where = "<unlocked>";
+    error = pthread_spin_init(&l->lock, pshared);
+    if (OVS_UNLIKELY(error)) {
+        ovs_abort(error, "pthread_spin_init failed");
+    }
+}
+
+void
+ovs_spin_init(const struct ovs_spin *spin)
+{
+    ovs_spin_init__(spin, PTHREAD_PROCESS_PRIVATE);
+}
+#endif
 
 /* Initializes the 'barrier'.  'size' is the number of threads
  * expected to hit the barrier. */
@@ -315,7 +344,7 @@ ovs_barrier_block(struct ovs_barrier *barrier)
     }
 }
 
-DEFINE_EXTERN_PER_THREAD_DATA(ovsthread_id, 0);
+DEFINE_EXTERN_PER_THREAD_DATA(ovsthread_id, OVSTHREAD_ID_UNSET);
 
 struct ovsthread_aux {
     void *(*start)(void *);
@@ -323,17 +352,23 @@ struct ovsthread_aux {
     char name[16];
 };
 
+unsigned int
+ovsthread_id_init(void)
+{
+    static atomic_count next_id = ATOMIC_COUNT_INIT(0);
+
+    ovs_assert(*ovsthread_id_get() == OVSTHREAD_ID_UNSET);
+    return *ovsthread_id_get() = atomic_count_inc(&next_id);
+}
+
 static void *
 ovsthread_wrapper(void *aux_)
 {
-    static atomic_count next_id = ATOMIC_COUNT_INIT(1);
-
     struct ovsthread_aux *auxp = aux_;
     struct ovsthread_aux aux;
     unsigned int id;
 
-    id = atomic_count_inc(&next_id);
-    *ovsthread_id_get() = id;
+    id = ovsthread_id_init();
 
     aux = *auxp;
     free(auxp);
@@ -402,7 +437,7 @@ ovs_thread_create(const char *name, void *(*start)(void *), void *arg)
 
     /* Some small systems use a default stack size as small as 80 kB, but OVS
      * requires approximately 384 kB according to the following analysis:
-     * http://openvswitch.org/pipermail/dev/2016-January/065049.html
+     * https://mail.openvswitch.org/pipermail/ovs-dev/2016-January/308592.html
      *
      * We use 512 kB to give us some margin of error. */
     pthread_attr_t attr;

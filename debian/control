@@ -2,7 +2,7 @@ Source: openvswitch
 Section: net
 Priority: extra
 Maintainer: Open vSwitch developers <dev@openvswitch.org>
-Uploaders: Ben Pfaff <pfaffben@debian.org>, Simon Horman <horms@debian.org>
+Uploaders: Simon Horman <horms@debian.org>
 Build-Depends: graphviz,
                autoconf (>= 2.64),
                automake (>= 1.10) | automake1.10,
@@ -16,7 +16,8 @@ Build-Depends: graphviz,
                python-all (>= 2.7),
                python-twisted-conch,
                python-zopeinterface,
-               python-six
+               python-six,
+               libunbound-dev
 Standards-Version: 3.9.3
 Homepage: http://openvswitch.org/
 
@@ -40,7 +41,7 @@ Description: Open vSwitch datapath module source - module-assistant version
 
 Package: openvswitch-datapath-dkms
 Architecture: all
-Depends: dkms (>= 1.95), libc6-dev, make, ${misc:Depends}, ${python:Depends}
+Depends: dkms (>= 1.95), libc6-dev, libelf-dev, make, ${misc:Depends}, ${python:Depends}
 Description: Open vSwitch datapath module source - DKMS version
  Open vSwitch is a production quality, multilayer, software-based,
  Ethernet virtual switch. It is designed to enable massive network
@@ -57,8 +58,7 @@ Description: Open vSwitch datapath module source - DKMS version
 Package: openvswitch-common
 Architecture: linux-any
 Multi-Arch: foreign
-Depends: openssl,
-         python (>= 2.7),
+Depends: python (>= 2.7),
          python-six,
          libopenvswitch (= ${binary:Version}),
          ${misc:Depends},
@@ -81,7 +81,7 @@ Description: Open vSwitch common components
 Package: libopenvswitch
 Architecture: linux-any
 Multi-Arch: same
-Depends: libssl-dev,
+Depends: openssl,
          ${misc:Depends},
          ${shlibs:Depends}
 Description: Open vSwitch common components
@@ -307,6 +307,8 @@ Architecture: linux-any
 Multi-Arch: same
 Depends:
  libopenvswitch (>= ${binary:Version}),
+ libssl-dev,
+ libunbound-dev,
  ${misc:Depends}
 Conflicts: openvswitch-dev
 Replaces: openvswitch-dev
@@ -320,3 +322,24 @@ Description: Open vSwitch development package
  1000V.
  .
  This package provides openvswitch headers and libopenvswitch for developers.
+
+Package: openvswitch-ipsec
+Architecture: linux-any
+Depends: iproute2,
+         openvswitch-common (= ${binary:Version}),
+         openvswitch-switch (= ${binary:Version}),
+         python,
+         python-openvswitch (= ${source:Version}),
+         strongswan,
+         ${misc:Depends},
+         ${shlibs:Depends}
+Description: Open vSwitch IPsec tunneling support
+ Open vSwitch is a production quality, multilayer, software-based,
+ Ethernet virtual switch. It is designed to enable massive network
+ automation through programmatic extension, while still supporting
+ standard management interfaces and protocols (e.g. NetFlow, IPFIX,
+ sFlow, SPAN, RSPAN, CLI, LACP, 802.1ag). In addition, it is designed
+ to support distribution across multiple physical servers similar to
+ VMware's vNetwork distributed vswitch or Cisco's Nexus 1000V.
+ .
+ This package provides IPsec tunneling support for OVS tunnels.

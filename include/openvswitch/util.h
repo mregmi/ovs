@@ -44,13 +44,16 @@ const char *ovs_get_program_version(void);
      : (X) <= UINT_MAX / (Y) ? (unsigned int) (X) * (unsigned int) (Y)  \
      : UINT_MAX)
 
-/* Like the standard assert macro, except writes the failure message to the
- * log. */
+/* Like the standard assert macro, except:
+ *
+ *    - Writes the failure message to the log.
+ *
+ *    - Always evaluates the condition, even with NDEBUG. */
 #ifndef NDEBUG
 #define ovs_assert(CONDITION)                                           \
-    if (!OVS_LIKELY(CONDITION)) {                                       \
-        ovs_assert_failure(OVS_SOURCE_LOCATOR, __func__, #CONDITION);       \
-    }
+    (OVS_LIKELY(CONDITION)                                              \
+     ? (void) 0                                                         \
+     : ovs_assert_failure(OVS_SOURCE_LOCATOR, __func__, #CONDITION))
 #else
 #define ovs_assert(CONDITION) ((void) (CONDITION))
 #endif
@@ -185,11 +188,11 @@ OVS_NO_RETURN void ovs_assert_failure(const char *, const char *, const char *);
 /* C++ doesn't allow a type declaration within "sizeof", but it does support
  * scoping for member names, so we can just declare a second member, with a
  * name and the same type, and then use its size. */
-#define PADDED_MEMBERS(UNIT, MEMBERS)                           \
-    union {                                                     \
-        struct { MEMBERS };                                     \
-        struct { MEMBERS } named_member__;                      \
-        uint8_t PAD_ID[ROUND_UP(sizeof named_member__, UNIT)];  \
+#define PADDED_MEMBERS(UNIT, MEMBERS)                                       \
+    struct named_member__ { MEMBERS };                                      \
+    union {                                                                 \
+        struct { MEMBERS };                                                 \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct named_member__), UNIT)];      \
     }
 #endif
 
@@ -232,12 +235,12 @@ OVS_NO_RETURN void ovs_assert_failure(const char *, const char *, const char *);
         uint8_t PAD_ID[ROUND_UP(sizeof(struct { MEMBERS }), UNIT)]; \
     }
 #else
-#define PADDED_MEMBERS_CACHELINE_MARKER(UNIT, CACHELINE, MEMBERS)   \
-    union {                                                         \
-        OVS_CACHE_LINE_MARKER CACHELINE;                            \
-        struct { MEMBERS };                                         \
-        struct { MEMBERS } named_member__;                          \
-        uint8_t PAD_ID[ROUND_UP(sizeof named_member__, UNIT)];      \
+#define PADDED_MEMBERS_CACHELINE_MARKER(UNIT, CACHELINE, MEMBERS)           \
+    struct struct_##CACHELINE { MEMBERS };                                  \
+    union {                                                                 \
+        OVS_CACHE_LINE_MARKER CACHELINE;                                    \
+        struct { MEMBERS };                                                 \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct struct_##CACHELINE), UNIT)];  \
     }
 #endif
 
@@ -270,8 +273,14 @@ is_pow2(uintmax_t x)
 #define BITMAP_ULONG_BITS (sizeof(unsigned long) * CHAR_BIT)
 #define BITMAP_N_LONGS(N_BITS) DIV_ROUND_UP(N_BITS, BITMAP_ULONG_BITS)
 
-/* Given ATTR, and TYPE, cast the ATTR to TYPE by first casting ATTR to
- * (void *). This is to suppress the alignment warning issued by clang. */
+/* Given ATTR, and TYPE, cast the ATTR to TYPE by first casting ATTR to (void
+ * *).  This suppresses the alignment warning issued by Clang and newer
+ * versions of GCC when a pointer is cast to a type with a stricter alignment.
+ *
+ * Add ALIGNED_CAST only if you are sure that the cast is actually correct,
+ * that is, that the pointer is actually properly aligned for the stricter
+ * type.  On RISC architectures, dereferencing a misaligned pointer can cause a
+ * segfault, so it is important to be aware of correct alignment. */
 #define ALIGNED_CAST(TYPE, ATTR) ((TYPE) (void *) (ATTR))
 
 #ifdef __cplusplus

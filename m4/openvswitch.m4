@@ -1,6 +1,6 @@
 # -*- autoconf -*-
 
-# Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
+# Copyright (c) 2008-2016, 2019 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,16 +60,6 @@ AC_DEFUN([OVS_CHECK_NDEBUG],
      [ndebug=false])
    AM_CONDITIONAL([NDEBUG], [test x$ndebug = xtrue])])
 
-dnl Checks for ESX.
-AC_DEFUN([OVS_CHECK_ESX],
-  [AC_CHECK_HEADER([vmware.h],
-                   [ESX=yes],
-                   [ESX=no])
-   AM_CONDITIONAL([ESX], [test "$ESX" = yes])
-   if test "$ESX" = yes; then
-      AC_DEFINE([ESX], [1], [Define to 1 if building on ESX.])
-   fi])
-
 dnl Checks for MSVC x64 compiler.
 AC_DEFUN([OVS_CHECK_WIN64],
   [AC_CACHE_CHECK(
@@ -79,11 +69,14 @@ AC_DEFUN([OVS_CHECK_WIN64],
      if (cl) 2>&1 | grep 'x64' >/dev/null 2>&1; then
        cl_cv_x64=yes
        MSVC64_LDFLAGS=" /MACHINE:X64 "
+       MSVC_PLATFORM="x64"
      else
        cl_cv_x64=no
        MSVC64_LDFLAGS=""
+       MSVC_PLATFORM="x86"
      fi])
      AC_SUBST([MSVC64_LDFLAGS])
+     AC_SUBST([MSVC_PLATFORM])
 ])
 
 dnl Checks for WINDOWS.
@@ -143,6 +136,7 @@ AC_DEFUN([OVS_CHECK_WIN32],
       )
 
       AC_DEFINE([WIN32], [1], [Define to 1 if building on WIN32.])
+      AC_CHECK_TYPES([struct timespec], [], [], [[#include <time.h>]])
       AH_BOTTOM([#ifdef WIN32
 #include "include/windows/windefs.h"
 #endif])
@@ -169,6 +163,32 @@ AC_ARG_WITH([vstudiotarget],
       )
 
   AC_SUBST([VSTUDIO_CONFIG])
+
+AC_ARG_WITH([vstudiotargetver],
+         [AS_HELP_STRING([--with-vstudiotargetver=target_ver1,target_ver2],
+            [Target versions: Win8,Win8.1,Win10])],
+         [
+            targetver=`echo "$withval" | tr -s , ' ' `
+            for ver in $targetver; do
+                case "$ver" in
+                "Win8") VSTUDIO_WIN8=true ;;
+                "Win8.1")  VSTUDIO_WIN8_1=true ;;
+                "Win10") VSTUDIO_WIN10=true ;;
+                *) AC_MSG_ERROR([No valid Visual Studio target version found]) ;;
+                esac
+            done
+
+         ], [
+            VSTUDIO_WIN8=true
+            VSTUDIO_WIN8_1=true
+            VSTUDIO_WIN10=true
+         ]
+      )
+
+  AM_CONDITIONAL([VSTUDIO_WIN8], [test -n "$VSTUDIO_WIN8"])
+  AM_CONDITIONAL([VSTUDIO_WIN8_1], [test -n "$VSTUDIO_WIN8_1"])
+  AM_CONDITIONAL([VSTUDIO_WIN10], [test -n "$VSTUDIO_WIN10"])
+
   AC_DEFINE([VSTUDIO_DDK], [1], [System uses the Visual Studio build target.])
   AM_CONDITIONAL([VSTUDIO_DDK], [test -n "$VSTUDIO_CONFIG"])
 ])
@@ -255,7 +275,24 @@ OpenFlow connections over SSL will not be supported.
    AM_CONDITIONAL([HAVE_OPENSSL], [test "$HAVE_OPENSSL" = yes])
    if test "$HAVE_OPENSSL" = yes; then
       AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if OpenSSL is installed.])
-   fi])
+   fi
+
+   OPENSSL_SUPPORTS_SNI=no
+   if test $HAVE_OPENSSL = yes; then
+      save_CPPFLAGS=$CPPFLAGS
+      CPPFLAGS="$CPPFLAGS $SSL_INCLUDES"
+      AC_CHECK_DECL([SSL_set_tlsext_host_name], [OPENSSL_SUPPORTS_SNI=yes],
+                    [], [#include <openssl/ssl.h>
+])
+      if test $OPENSSL_SUPPORTS_SNI = yes; then
+        AC_DEFINE(
+          [OPENSSL_SUPPORTS_SNI], [1],
+          [Define to 1 if OpenSSL supports Server Name Indication (SNI).])
+      fi
+      CPPFLAGS=$save_CPPFLAGS
+   fi
+   AC_SUBST([OPENSSL_SUPPORTS_SNI])
+])
 
 dnl Checks for libraries needed by lib/socket-util.c.
 AC_DEFUN([OVS_CHECK_SOCKET_LIBS],
@@ -318,15 +355,15 @@ AC_DEFUN([OVS_CHECK_VALGRIND],
   [AC_CHECK_HEADERS([valgrind/valgrind.h])])
 
 dnl Checks for Python 2.x, x >= 7.
-AC_DEFUN([OVS_CHECK_PYTHON],
+AC_DEFUN([OVS_CHECK_PYTHON2],
   [AC_CACHE_CHECK(
      [for Python 2.x for x >= 7],
-     [ovs_cv_python],
-     [if test -n "$PYTHON"; then
-        ovs_cv_python=$PYTHON
+     [ovs_cv_python2],
+     [if test -n "$PYTHON2"; then
+        ovs_cv_python2=$PYTHON2
       else
-        ovs_cv_python=no
-        for binary in python python2.7; do
+        ovs_cv_python2=no
+        for binary in python2 python2.7 python; do
           ovs_save_IFS=$IFS; IFS=$PATH_SEPARATOR
           for dir in $PATH; do
             IFS=$ovs_save_IFS
@@ -336,31 +373,27 @@ if sys.hexversion >= 0x02070000 and sys.hexversion < 0x03000000:
     sys.exit(0)
 else:
     sys.exit(1)'; then
-              ovs_cv_python=$dir/$binary
+              ovs_cv_python2=$dir/$binary
               break 2
             fi
           done
         done
+        if test "$ovs_cv_python2" != no && test -x "$ovs_cv_python2"; then
+          if ! "$ovs_cv_python2" -c 'import six ; six.moves.range' >&AS_MESSAGE_LOG_FD 2>&1; then
+            ovs_cv_python2=no
+            AC_MSG_WARN([Missing Python six library or version too old.])
+          fi
+        fi
       fi])
-
-   # Set $PYTHON from cache variable.
-   if test $ovs_cv_python = no; then
-     AC_MSG_ERROR([cannot find python 2.7 or higher.])
+   AC_SUBST([HAVE_PYTHON2])
+   AM_MISSING_PROG([PYTHON2], [python2])
+   if test "$ovs_cv_python2" != no; then
+     PYTHON2=$ovs_cv_python2
+     HAVE_PYTHON2=yes
+   else
+     HAVE_PYTHON2=no
    fi
-   AM_MISSING_PROG([PYTHON], [python])
-   PYTHON=$ovs_cv_python
-
-   # HAVE_PYTHON is always true.  (Python has not always been a build
-   # requirement, so this variable is now obsolete.)
-   AC_SUBST([HAVE_PYTHON])
-   HAVE_PYTHON=yes
-   AM_CONDITIONAL([HAVE_PYTHON], [test "$HAVE_PYTHON" = yes])
-
-   AC_MSG_CHECKING([whether $PYTHON has six library])
-   if ! $PYTHON -c 'import six ; six.moves.range' >&AS_MESSAGE_LOG_FD 2>&1; then
-     AC_MSG_ERROR([Missing Python six library or version too old.])
-   fi
-   AC_MSG_RESULT([yes])])
+   AM_CONDITIONAL([HAVE_PYTHON2], [test "$HAVE_PYTHON2" = yes])])
 
 dnl Checks for Python 3.x, x >= 4.
 AC_DEFUN([OVS_CHECK_PYTHON3],
@@ -386,7 +419,7 @@ else:
             fi
           done
         done
-        if test $ovs_cv_python3 != no; then
+        if test "$ovs_cv_python3" != no; then
           if test -x "$ovs_cv_python3" && ! "$ovs_cv_python3" -c 'import six' >/dev/null 2>&1; then
             ovs_cv_python3=no
             AC_MSG_WARN([Missing Python six library.])
@@ -395,7 +428,7 @@ else:
       fi])
    AC_SUBST([HAVE_PYTHON3])
    AM_MISSING_PROG([PYTHON3], [python3])
-   if test $ovs_cv_python3 != no; then
+   if test "$ovs_cv_python3" != no; then
      PYTHON3=$ovs_cv_python3
      HAVE_PYTHON3=yes
    else
@@ -403,6 +436,29 @@ else:
    fi
    AM_CONDITIONAL([HAVE_PYTHON3], [test "$HAVE_PYTHON3" = yes])])
 
+dnl Checks if you have any compatible Python version installed.
+dnl Python 2.7+ has the preference to 3.4+
+AC_DEFUN([OVS_CHECK_PYTHON],
+  [AC_CACHE_CHECK(
+     [for Python 2 or 3],
+     [ovs_cv_python],
+     [if test -n "$PYTHON"; then
+        ovs_cv_python=$PYTHON
+      else
+        ovs_cv_python=no
+        if test "$ovs_cv_python2" != no; then
+          ovs_cv_python=$ovs_cv_python2
+        elif test "$ovs_cv_python3" != no; then
+          ovs_cv_python=$ovs_cv_python3
+        else
+          AC_MSG_ERROR([Missing Python.])
+        fi
+      fi])
+    AC_SUBST([PYTHON])
+    PYTHON=$ovs_cv_python
+    AC_SUBST([HAVE_PYTHON])
+    HAVE_PYTHON=yes
+    AM_CONDITIONAL([HAVE_PYTHON], [test "$HAVE_PYTHON" = yes])])
 
 dnl Checks for flake8.
 AC_DEFUN([OVS_CHECK_FLAKE8],
@@ -569,7 +625,7 @@ TEST_ATOMIC_TYPE(unsigned long long int);
 dnl OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE(SIZE)
 dnl
 dnl Checks __atomic_always_lock_free(SIZE, 0)
-AC_DEFUN([OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE], 
+AC_DEFUN([OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE],
   [AC_CACHE_CHECK(
     [value of __atomic_always_lock_free($1)],
     [ovs_cv_atomic_always_lock_free_$1],
@@ -632,7 +688,20 @@ AC_DEFUN([OVS_CHECK_CXX],
    AX_CXX_COMPILE_STDCXX([11], [], [optional])
    if test $enable_Werror = yes && test $HAVE_CXX11 = 1; then
      enable_cxx=:
+     AC_LANG_PUSH([C++])
+     AC_CHECK_HEADERS([atomic])
+     AC_LANG_POP([C++])
    else
      enable_cxx=false
    fi
    AM_CONDITIONAL([HAVE_CXX], [$enable_cxx])])
+
+dnl Checks for unbound library.
+AC_DEFUN([OVS_CHECK_UNBOUND],
+  [AC_CHECK_LIB(unbound, ub_ctx_create, [HAVE_UNBOUND=yes], [HAVE_UNBOUND=no])
+   if test "$HAVE_UNBOUND" = yes; then
+     AC_DEFINE([HAVE_UNBOUND], [1], [Define to 1 if unbound is detected.])
+     LIBS="$LIBS -lunbound"
+   fi
+   AM_CONDITIONAL([HAVE_UNBOUND], [test "$HAVE_UNBOUND" = yes])
+   AC_SUBST([HAVE_UNBOUND])])

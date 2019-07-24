@@ -38,7 +38,7 @@
 #include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "process.h"
 #include "stream.h"
 #include "stream-ssl.h"
@@ -69,7 +69,7 @@ static bool dry_run;
 static bool wait_for_reload = true;
 
 /* --timeout: Time to wait for a connection to 'db'. */
-static int timeout;
+static unsigned int timeout;
 
 /* --retry: If true, ovs-vsctl will retry connecting to the database forever.
  * If false and --db says to use an active connection method (e.g. "unix:",
@@ -97,7 +97,7 @@ OVS_NO_RETURN static void usage(void);
 static void parse_options(int argc, char *argv[], struct shash *local_options);
 static void run_prerequisites(struct ctl_command[], size_t n_commands,
                               struct ovsdb_idl *);
-static void do_vsctl(const char *args, struct ctl_command *, size_t n,
+static bool do_vsctl(const char *args, struct ctl_command *, size_t n,
                      struct ovsdb_idl *);
 
 /* post_db_reload_check frame work is to allow ovs-vsctl to do additional
@@ -136,7 +136,6 @@ main(int argc, char *argv[])
     struct shash local_options;
     unsigned int seqno;
     size_t n_commands;
-    char *args;
 
     set_program_name(argv[0]);
     fatal_ignore_sigpipe();
@@ -145,19 +144,19 @@ main(int argc, char *argv[])
 
     vsctl_cmd_init();
 
-    /* Log our arguments.  This is often valuable for debugging systems. */
-    args = process_escape_args(argv);
-    VLOG(ctl_might_write_to_db(argv) ? VLL_INFO : VLL_DBG, "Called as %s", args);
-
     /* Parse command line. */
+    char *args = process_escape_args(argv);
     shash_init(&local_options);
     parse_options(argc, argv, &local_options);
-    commands = ctl_parse_commands(argc - optind, argv + optind, &local_options,
-                                  &n_commands);
-
-    if (timeout) {
-        time_alarm(timeout);
+    char *error = ctl_parse_commands(argc - optind, argv + optind,
+                                     &local_options, &commands, &n_commands);
+    if (error) {
+        ctl_fatal("%s", error);
     }
+    VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
+         "Called as %s", args);
+
+    ctl_timeout_setup(timeout);
 
     /* Initialize IDL. */
     idl = the_idl = ovsdb_idl_create(db, &ovsrec_idl_class, false, retry);
@@ -181,7 +180,10 @@ main(int argc, char *argv[])
 
         if (seqno != ovsdb_idl_get_seqno(idl)) {
             seqno = ovsdb_idl_get_seqno(idl);
-            do_vsctl(args, commands, n_commands, idl);
+            if (do_vsctl(args, commands, n_commands, idl)) {
+                free(args);
+                exit(EXIT_SUCCESS);
+            }
         }
 
         if (seqno == ovsdb_idl_get_seqno(idl)) {
@@ -307,10 +309,8 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             exit(EXIT_SUCCESS);
 
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout < 0) {
-                ctl_fatal("value %s on -t or --timeout is invalid",
-                            optarg);
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
+                ctl_fatal("value %s on -t or --timeout is invalid", optarg);
             }
             break;
 
@@ -389,6 +389,7 @@ Interface commands (a bond consists of multiple interfaces):\n\
 Controller commands:\n\
   get-controller BRIDGE      print the controllers for BRIDGE\n\
   del-controller BRIDGE      delete the controllers for BRIDGE\n\
+  [--inactivity-probe=MSECS]\n\
   set-controller BRIDGE TARGET...  set the controllers for BRIDGE\n\
   get-fail-mode BRIDGE       print the fail-mode for BRIDGE\n\
   del-fail-mode BRIDGE       delete the fail-mode for BRIDGE\n\
@@ -397,6 +398,7 @@ Controller commands:\n\
 Manager commands:\n\
   get-manager                print the managers\n\
   del-manager                delete the managers\n\
+  [--inactivity-probe=MSECS]\n\
   set-manager TARGET...      set the list of managers to TARGET...\n\
 \n\
 SSL commands:\n\
@@ -413,6 +415,7 @@ Switch commands:\n\
   emer-reset                  reset switch to known good state\n\
 \n\
 %s\
+%s\
 \n\
 Options:\n\
   --db=DATABASE               connect to DATABASE\n\
@@ -422,12 +425,13 @@ Options:\n\
   -t, --timeout=SECS          wait at most SECS seconds for ovs-vswitchd\n\
   --dry-run                   do not commit changes to database\n\
   --oneline                   print exactly one line of output per command\n",
-           program_name, program_name, ctl_get_db_cmd_usage(), ctl_default_db());
+           program_name, program_name, ctl_get_db_cmd_usage(),
+           ctl_list_db_tables_usage(), ctl_default_db());
     table_usage();
     vlog_usage();
     printf("\
   --no-syslog             equivalent to --verbose=vsctl:syslog:warn\n");
-    stream_usage("database", true, true, false);
+    stream_usage("database", true, true, true);
     printf("\n\
 Other options:\n\
   -h, --help                  display this help message\n\
@@ -997,6 +1001,7 @@ static struct cmd_show_table cmd_show_tables[] = {
      &ovsrec_bridge_col_name,
      {&ovsrec_bridge_col_controller,
       &ovsrec_bridge_col_fail_mode,
+      &ovsrec_bridge_col_datapath_type,
       &ovsrec_bridge_col_ports},
      {NULL, NULL, NULL}
     },
@@ -1013,7 +1018,8 @@ static struct cmd_show_table cmd_show_tables[] = {
      &ovsrec_interface_col_name,
      {&ovsrec_interface_col_type,
       &ovsrec_interface_col_options,
-      &ovsrec_interface_col_error},
+      &ovsrec_interface_col_error,
+      &ovsrec_interface_col_bfd_status},
      {NULL, NULL, NULL}
     },
 
@@ -1585,8 +1591,11 @@ add_port(struct ctl_context *ctx,
     }
 
     for (i = 0; i < n_settings; i++) {
-        ctl_set_column("Port", &port->header_, settings[i],
-                       ctx->symtab);
+        char *error = ctl_set_column("Port", &port->header_, settings[i],
+                                     ctx->symtab);
+        if (error) {
+            ctl_fatal("%s", error);
+        }
     }
 
     bridge_insert_port((bridge->parent ? bridge->parent->br_cfg
@@ -1634,6 +1643,71 @@ cmd_add_bond(struct ctl_context *ctx)
 }
 
 static void
+cmd_add_bond_iface(struct ctl_context *ctx)
+{
+    vsctl_context_populate_cache(ctx);
+
+    struct vsctl_context *vsctl_ctx = vsctl_context_cast(ctx);
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
+    struct vsctl_port *port = find_port(vsctl_ctx, ctx->argv[1], true);
+
+    const char *iface_name = ctx->argv[2];
+    if (may_exist) {
+        struct vsctl_iface *iface = find_iface(vsctl_ctx, iface_name, false);
+        if (iface) {
+            if (iface->port == port) {
+                return;
+            }
+            char *command = vsctl_context_to_string(ctx);
+            ctl_fatal("\"%s\" but %s is actually attached to port %s",
+                      command, iface_name, iface->port->port_cfg->name);
+        }
+    }
+    check_conflicts(vsctl_ctx, iface_name,
+                    xasprintf("cannot create an interface named %s",
+                              iface_name));
+
+    struct ovsrec_interface *iface = ovsrec_interface_insert(ctx->txn);
+    ovsrec_interface_set_name(iface, iface_name);
+    ovsrec_port_update_interfaces_addvalue(port->port_cfg, iface);
+    post_db_reload_expect_iface(iface);
+    add_iface_to_cache(vsctl_ctx, port, iface);
+}
+
+static void
+cmd_del_bond_iface(struct ctl_context *ctx)
+{
+    vsctl_context_populate_cache(ctx);
+
+    struct vsctl_context *vsctl_ctx = vsctl_context_cast(ctx);
+    const char *iface_name = ctx->argv[ctx->argc - 1];
+    bool must_exist = !shash_find(&ctx->options, "--if-exists");
+    struct vsctl_iface *iface = find_iface(vsctl_ctx, iface_name, must_exist);
+    if (!iface) {
+        ovs_assert(!must_exist);
+        return;
+    }
+
+    const char *port_name = ctx->argc > 2 ? ctx->argv[1] : NULL;
+    if (port_name) {
+        struct vsctl_port *port = find_port(vsctl_ctx, port_name, true);
+        if (iface->port != port) {
+            ctl_fatal("port %s does not have an interface %s",
+                      port_name, iface_name);
+        }
+    }
+
+    if (ovs_list_is_short(&iface->port->ifaces)) {
+        ctl_fatal("cannot delete last interface from port %s",
+                  iface->port->port_cfg->name);
+    }
+
+    ovsrec_port_update_interfaces_delvalue(iface->port->port_cfg,
+                                           iface->iface_cfg);
+    del_cached_iface(vsctl_ctx, iface);
+}
+
+static void
 cmd_del_port(struct ctl_context *ctx)
 {
     struct vsctl_context *vsctl_ctx = vsctl_context_cast(ctx);
@@ -1675,9 +1749,9 @@ cmd_del_port(struct ctl_context *ctx)
             if (port->bridge != bridge) {
                 if (port->bridge->parent == bridge) {
                     ctl_fatal("bridge %s does not have a port %s (although "
-                                "its parent bridge %s does)",
+                                "its child bridge %s does)",
                                 ctx->argv[1], ctx->argv[2],
-                                bridge->parent->name);
+                                port->bridge->name);
                 } else {
                     ctl_fatal("bridge %s does not have a port %s",
                                 ctx->argv[1], ctx->argv[2]);
@@ -1784,6 +1858,7 @@ pre_controller(struct ctl_context *ctx)
     pre_get_info(ctx);
 
     ovsdb_idl_add_column(ctx->idl, &ovsrec_controller_col_target);
+    ovsdb_idl_add_column(ctx->idl, &ovsrec_controller_col_inactivity_probe);
 }
 
 static void
@@ -1844,18 +1919,24 @@ cmd_del_controller(struct ctl_context *ctx)
 }
 
 static struct ovsrec_controller **
-insert_controllers(struct ovsdb_idl_txn *txn, char *targets[], size_t n)
+insert_controllers(struct ctl_context *ctx, char *targets[], size_t n)
 {
     struct ovsrec_controller **controllers;
     size_t i;
+    const char *inactivity_probe = shash_find_data(&ctx->options,
+                                                   "--inactivity-probe");
 
     controllers = xmalloc(n * sizeof *controllers);
     for (i = 0; i < n; i++) {
         if (vconn_verify_name(targets[i]) && pvconn_verify_name(targets[i])) {
             VLOG_WARN("target type \"%s\" is possibly erroneous", targets[i]);
         }
-        controllers[i] = ovsrec_controller_insert(txn);
+        controllers[i] = ovsrec_controller_insert(ctx->txn);
         ovsrec_controller_set_target(controllers[i], targets[i]);
+        if (inactivity_probe) {
+            int64_t msecs = atoll(inactivity_probe);
+            ovsrec_controller_set_inactivity_probe(controllers[i], &msecs, 1);
+        }
     }
 
     return controllers;
@@ -1877,7 +1958,7 @@ cmd_set_controller(struct ctl_context *ctx)
     delete_controllers(br->controller, br->n_controller);
 
     n = ctx->argc - 2;
-    controllers = insert_controllers(ctx->txn, &ctx->argv[2], n);
+    controllers = insert_controllers(ctx, &ctx->argv[2], n);
     ovsrec_bridge_set_controller(br, controllers, n);
     free(controllers);
 }
@@ -1953,6 +2034,7 @@ pre_manager(struct ctl_context *ctx)
 {
     ovsdb_idl_add_column(ctx->idl, &ovsrec_open_vswitch_col_manager_options);
     ovsdb_idl_add_column(ctx->idl, &ovsrec_manager_col_target);
+    ovsdb_idl_add_column(ctx->idl, &ovsrec_manager_col_inactivity_probe);
 }
 
 static void
@@ -2004,10 +2086,13 @@ cmd_del_manager(struct ctl_context *ctx)
 }
 
 static void
-insert_managers(struct vsctl_context *vsctl_ctx, char *targets[], size_t n)
+insert_managers(struct vsctl_context *vsctl_ctx, char *targets[], size_t n,
+                struct shash *options)
 {
     struct ovsrec_manager **managers;
     size_t i;
+    const char *inactivity_probe = shash_find_data(options,
+                                                   "--inactivity-probe");
 
     /* Insert each manager in a new row in Manager table. */
     managers = xmalloc(n * sizeof *managers);
@@ -2017,6 +2102,10 @@ insert_managers(struct vsctl_context *vsctl_ctx, char *targets[], size_t n)
         }
         managers[i] = ovsrec_manager_insert(vsctl_ctx->base.txn);
         ovsrec_manager_set_target(managers[i], targets[i]);
+        if (inactivity_probe) {
+            int64_t msecs = atoll(inactivity_probe);
+            ovsrec_manager_set_inactivity_probe(managers[i], &msecs, 1);
+        }
     }
 
     /* Store uuids of new Manager rows in 'manager_options' column. */
@@ -2032,7 +2121,7 @@ cmd_set_manager(struct ctl_context *ctx)
 
     verify_managers(vsctl_ctx->ovs);
     delete_managers(vsctl_ctx->ovs);
-    insert_managers(vsctl_ctx, &ctx->argv[1], n);
+    insert_managers(vsctl_ctx, &ctx->argv[1], n, &ctx->options);
 }
 
 static void
@@ -2439,6 +2528,9 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
 
             vsctl_context_init(&vsctl_ctx, c, idl, NULL, NULL, NULL);
             (c->syntax->prerequisites)(&vsctl_ctx.base);
+            if (vsctl_ctx.base.error) {
+                ctl_fatal("%s", vsctl_ctx.base.error);
+            }
             vsctl_context_done(&vsctl_ctx, c);
 
             ovs_assert(!c->output.string);
@@ -2482,7 +2574,7 @@ vsctl_parent_process_info(void)
 #endif
 }
 
-static void
+static bool
 do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
          struct ovsdb_idl *idl)
 {
@@ -2494,7 +2586,6 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
     struct ctl_command *c;
     struct shash_node *node;
     int64_t next_cfg = 0;
-    char *error = NULL;
     char *ppid_info = NULL;
 
     txn = the_idl_txn = ovsdb_idl_txn_create(idl);
@@ -2534,6 +2625,9 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
         if (c->syntax->run) {
             (c->syntax->run)(&vsctl_ctx.base);
         }
+        if (vsctl_ctx.base.error) {
+            ctl_fatal("%s", vsctl_ctx.base.error);
+        }
         vsctl_context_done_command(&vsctl_ctx, c);
 
         if (vsctl_ctx.base.try_again) {
@@ -2572,11 +2666,13 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
             if (c->syntax->postprocess) {
                 vsctl_context_init(&vsctl_ctx, c, idl, txn, ovs, symtab);
                 (c->syntax->postprocess)(&vsctl_ctx.base);
+                if (vsctl_ctx.base.error) {
+                    ctl_fatal("%s", vsctl_ctx.base.error);
+                }
                 vsctl_context_done(&vsctl_ctx, c);
             }
         }
     }
-    error = xstrdup(ovsdb_idl_txn_get_error(txn));
 
     switch (status) {
     case TXN_UNCOMMITTED:
@@ -2595,7 +2691,7 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
         goto try_again;
 
     case TXN_ERROR:
-        ctl_fatal("transaction error: %s", error);
+        ctl_fatal("transaction error: %s", ovsdb_idl_txn_get_error(txn));
 
     case TXN_NOT_LOCKED:
         /* Should not happen--we never call ovsdb_idl_set_lock(). */
@@ -2604,7 +2700,6 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
     default:
         OVS_NOT_REACHED();
     }
-    free(error);
 
     ovsdb_symbol_table_destroy(symtab);
 
@@ -2666,7 +2761,7 @@ do_vsctl(const char *args, struct ctl_command *commands, size_t n_commands,
     ovsdb_idl_txn_destroy(txn);
     ovsdb_idl_destroy(idl);
 
-    exit(EXIT_SUCCESS);
+    return true;
 
 try_again:
     /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
@@ -2681,7 +2776,7 @@ try_again:
         table_destroy(c->table);
         free(c->table);
     }
-    free(error);
+    return false;
 }
 
 /* Frees the current transaction and the underlying IDL and then calls
@@ -2745,12 +2840,18 @@ static const struct ctl_command_syntax vsctl_commands[] = {
      RO},
     {"add-port", 2, INT_MAX, "BRIDGE NEW-PORT [COLUMN[:KEY]=VALUE]...",
      pre_get_info, cmd_add_port, NULL, "--may-exist", RW},
-    {"add-bond", 4, INT_MAX,
-     "BRIDGE NEW-BOND-PORT SYSIFACE... [COLUMN[:KEY]=VALUE]...", pre_get_info,
-     cmd_add_bond, NULL, "--may-exist,--fake-iface", RW},
     {"del-port", 1, 2, "[BRIDGE] PORT|IFACE", pre_get_info, cmd_del_port, NULL,
      "--if-exists,--with-iface", RW},
     {"port-to-br", 1, 1, "PORT", pre_get_info, cmd_port_to_br, NULL, "", RO},
+
+    /* Bond commands. */
+    {"add-bond", 4, INT_MAX,
+     "BRIDGE BOND IFACE... [COLUMN[:KEY]=VALUE]...", pre_get_info,
+     cmd_add_bond, NULL, "--may-exist,--fake-iface", RW},
+    {"add-bond-iface", 2, 2, "BOND IFACE", pre_get_info, cmd_add_bond_iface,
+     NULL, "--may-exist", RW},
+    {"del-bond-iface", 1, 2, "[BOND] IFACE", pre_get_info, cmd_del_bond_iface,
+     NULL, "--if-exists", RW},
 
     /* Interface commands. */
     {"list-ifaces", 1, 1, "BRIDGE", pre_get_info, cmd_list_ifaces, NULL, "",
@@ -2764,7 +2865,7 @@ static const struct ctl_command_syntax vsctl_commands[] = {
     {"del-controller", 1, 1, "BRIDGE", pre_controller, cmd_del_controller,
      NULL, "", RW},
     {"set-controller", 1, INT_MAX, "BRIDGE TARGET...", pre_controller,
-     cmd_set_controller, NULL, "", RW},
+     cmd_set_controller, NULL, "--inactivity-probe=", RW},
     {"get-fail-mode", 1, 1, "BRIDGE", pre_get_info, cmd_get_fail_mode, NULL,
      "", RO},
     {"del-fail-mode", 1, 1, "BRIDGE", pre_get_info, cmd_del_fail_mode, NULL,
@@ -2776,7 +2877,7 @@ static const struct ctl_command_syntax vsctl_commands[] = {
     {"get-manager", 0, 0, "", pre_manager, cmd_get_manager, NULL, "", RO},
     {"del-manager", 0, 0, "", pre_manager, cmd_del_manager, NULL, "", RW},
     {"set-manager", 1, INT_MAX, "TARGET...", pre_manager, cmd_set_manager,
-     NULL, "", RW},
+     NULL, "--inactivity-probe=", RW},
 
     /* SSL commands. */
     {"get-ssl", 0, 0, "", pre_cmd_get_ssl, cmd_get_ssl, NULL, "", RO},
@@ -2802,6 +2903,7 @@ static const struct ctl_command_syntax vsctl_commands[] = {
 static void
 vsctl_cmd_init(void)
 {
-    ctl_init(ovsrec_table_classes, tables, cmd_show_tables, vsctl_exit);
+    ctl_init(&ovsrec_idl_class, ovsrec_table_classes, tables, cmd_show_tables,
+             vsctl_exit);
     ctl_register_commands(vsctl_commands);
 }

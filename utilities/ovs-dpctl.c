@@ -15,13 +15,14 @@
  */
 
 #include <config.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -39,7 +40,6 @@
 #include "packets.h"
 #include "timeval.h"
 #include "util.h"
-#include "openvswitch/ofp-parse.h"
 #include "openvswitch/vlog.h"
 
 static struct dpctl_params dpctl_p;
@@ -100,8 +100,9 @@ parse_options(int argc, char *argv[])
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
 
     bool set_names = false;
+    unsigned int timeout = 0;
+
     for (;;) {
-        unsigned long int timeout;
         int c;
 
         c = getopt_long(argc, argv, short_options, long_options, NULL);
@@ -141,12 +142,8 @@ parse_options(int argc, char *argv[])
             break;
 
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout <= 0) {
-                ovs_fatal(0, "value %s on -t or --timeout is not at least 1",
-                          optarg);
-            } else {
-                time_alarm(timeout);
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
+                ovs_fatal(0, "value %s on -t or --timeout is invalid", optarg);
             }
             break;
 
@@ -171,6 +168,8 @@ parse_options(int argc, char *argv[])
         }
     }
     free(short_options);
+
+    ctl_timeout_setup(timeout);
 
     if (!set_names) {
         dpctl_p.names = dpctl_p.verbosity > 0;
@@ -198,8 +197,8 @@ usage(void *userdata OVS_UNUSED)
            "  del-flows [DP]             delete all flows from DP\n"
            "  dump-conntrack [DP] [zone=ZONE]  " \
                "display conntrack entries for ZONE\n"
-           "  flush-conntrack [DP] [zone=ZONE] " \
-               "delete all conntrack entries in ZONE\n"
+           "  flush-conntrack [DP] [zone=ZONE] [ct-tuple]" \
+               "delete matched conntrack entries in ZONE\n"
            "  ct-stats-show [DP] [zone=ZONE] [verbose] " \
                "CT connections grouped by protocol\n"
            "  ct-bkts [DP] [gt=N] display connections per CT bucket\n"

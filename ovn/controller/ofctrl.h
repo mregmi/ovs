@@ -21,22 +21,36 @@
 
 #include "openvswitch/meta-flow.h"
 #include "ovsdb-idl.h"
+#include "hindex.h"
 
-struct controller_ctx;
-struct group_table;
+struct ovn_extend_table;
 struct hmap;
 struct match;
 struct ofpbuf;
 struct ovsrec_bridge;
+struct sbrec_meter_table;
 struct shash;
 
+struct ovn_desired_flow_table {
+    /* Hash map flow table using flow match conditions as hash key.*/
+    struct hmap match_flow_table;
+
+    /* SB uuid index for the nodes in match_flow_table.*/
+    struct hindex uuid_flow_table;
+};
+
 /* Interface for OVN main loop. */
-void ofctrl_init(struct group_table *group_table);
-enum mf_field_id ofctrl_run(const struct ovsrec_bridge *br_int,
-                            struct shash *pending_ct_zones);
-bool ofctrl_can_put(void);
-void ofctrl_put(struct hmap *flow_table, struct shash *pending_ct_zones,
-                int64_t nb_cfg);
+void ofctrl_init(struct ovn_extend_table *group_table,
+                 struct ovn_extend_table *meter_table,
+                 int inactivity_probe_interval);
+void ofctrl_run(const struct ovsrec_bridge *br_int,
+                struct shash *pending_ct_zones);
+enum mf_field_id ofctrl_get_mf_field_id(void);
+void ofctrl_put(struct ovn_desired_flow_table *,
+                struct shash *pending_ct_zones,
+                const struct sbrec_meter_table *,
+                int64_t nb_cfg,
+                bool flow_changed);
 void ofctrl_wait(void);
 void ofctrl_destroy(void);
 int64_t ofctrl_get_cur_cfg(void);
@@ -46,16 +60,28 @@ struct ovn_flow *ofctrl_dup_flow(struct ovn_flow *source);
 void ofctrl_ct_flush_zone(uint16_t zone_id);
 
 char *ofctrl_inject_pkt(const struct ovsrec_bridge *br_int,
-                        const char *flow_s, const struct shash *addr_sets);
+                        const char *flow_s, const struct shash *addr_sets,
+                        const struct shash *port_groups);
 
 /* Flow table interfaces to the rest of ovn-controller. */
-void ofctrl_add_flow(struct hmap *desired_flows, uint8_t table_id,
+void ofctrl_add_flow(struct ovn_desired_flow_table *, uint8_t table_id,
                      uint16_t priority, uint64_t cookie,
-                     const struct match *, const struct ofpbuf *ofpacts);
+                     const struct match *, const struct ofpbuf *ofpacts,
+                     const struct uuid *);
 
-void ofctrl_flow_table_clear(void);
+void ofctrl_remove_flows(struct ovn_desired_flow_table *, const struct uuid *);
 
-void ovn_group_table_clear(struct group_table *group_table,
-                           bool existing);
+void ovn_desired_flow_table_init(struct ovn_desired_flow_table *);
+void ovn_desired_flow_table_clear(struct ovn_desired_flow_table *);
+void ovn_desired_flow_table_destroy(struct ovn_desired_flow_table *);
+
+void ofctrl_check_and_add_flow(struct ovn_desired_flow_table *,
+                               uint8_t table_id, uint16_t priority,
+                               uint64_t cookie, const struct match *,
+                               const struct ofpbuf *ofpacts,
+                               const struct uuid *, bool log_duplicate_flow);
+
+bool ofctrl_is_connected(void);
+void ofctrl_set_probe_interval(int probe_interval);
 
 #endif /* ovn/ofctrl.h */

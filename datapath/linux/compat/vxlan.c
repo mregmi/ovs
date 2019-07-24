@@ -52,6 +52,7 @@
 #include <net/ip6_route.h>
 #endif
 
+#include <net/tun_proto.h>
 #include <net/vxlan.h>
 #include "gso.h"
 #include "vport-netdev.h"
@@ -395,6 +396,17 @@ static void vxlan_notify_add_rx_port(struct vxlan_sock *vs)
 		if (dev->netdev_ops->ndo_add_vxlan_port)
 			dev->netdev_ops->ndo_add_vxlan_port(dev, sa_family,
 					port);
+#elif defined(HAVE_NDO_UDP_TUNNEL_ADD)
+		struct udp_tunnel_info ti;
+		if (vs->flags & VXLAN_F_GPE)
+			ti.type = UDP_TUNNEL_TYPE_VXLAN_GPE;
+		else
+			ti.type = UDP_TUNNEL_TYPE_VXLAN;
+		ti.sa_family = sa_family;
+		ti.port = inet_sk(sk)->inet_sport;
+
+		if (dev->netdev_ops->ndo_udp_tunnel_add)
+			dev->netdev_ops->ndo_udp_tunnel_add(dev, &ti);
 #endif
 	}
 	rcu_read_unlock();
@@ -416,6 +428,17 @@ static void vxlan_notify_del_rx_port(struct vxlan_sock *vs)
 		if (dev->netdev_ops->ndo_del_vxlan_port)
 			dev->netdev_ops->ndo_del_vxlan_port(dev, sa_family,
 					port);
+#elif defined(HAVE_NDO_UDP_TUNNEL_ADD)
+		struct udp_tunnel_info ti;
+		if (vs->flags & VXLAN_F_GPE)
+			ti.type = UDP_TUNNEL_TYPE_VXLAN_GPE;
+		else
+			ti.type = UDP_TUNNEL_TYPE_VXLAN;
+		ti.port = inet_sk(sk)->inet_sport;
+		ti.sa_family = sa_family;
+
+		if (dev->netdev_ops->ndo_udp_tunnel_del)
+			dev->netdev_ops->ndo_udp_tunnel_del(dev, &ti);
 #endif
 	}
 	rcu_read_unlock();
@@ -607,19 +630,9 @@ static bool vxlan_parse_gpe_hdr(struct vxlanhdr *unparsed,
 	if (gpe->oam_flag)
 		return false;
 
-	switch (gpe->next_protocol) {
-	case VXLAN_GPE_NP_IPV4:
-		*protocol = htons(ETH_P_IP);
-		break;
-	case VXLAN_GPE_NP_IPV6:
-		*protocol = htons(ETH_P_IPV6);
-		break;
-	case VXLAN_GPE_NP_ETHERNET:
-		*protocol = htons(ETH_P_TEB);
-		break;
-	default:
+	*protocol = tun_p_to_eth_p(gpe->next_protocol);
+	if (!*protocol)
 		return false;
-	}
 
 	unparsed->vx_flags &= ~VXLAN_GPE_USED_BITS;
 	return true;
@@ -815,19 +828,10 @@ static int vxlan_build_gpe_hdr(struct vxlanhdr *vxh, u32 vxflags,
 	struct vxlanhdr_gpe *gpe = (struct vxlanhdr_gpe *)vxh;
 
 	gpe->np_applied = 1;
-
-	switch (protocol) {
-	case htons(ETH_P_IP):
-		gpe->next_protocol = VXLAN_GPE_NP_IPV4;
-		return 0;
-	case htons(ETH_P_IPV6):
-		gpe->next_protocol = VXLAN_GPE_NP_IPV6;
-		return 0;
-	case htons(ETH_P_TEB):
-		gpe->next_protocol = VXLAN_GPE_NP_ETHERNET;
-		return 0;
-	}
-	return -EPFNOSUPPORT;
+	gpe->next_protocol = tun_p_from_eth_p(protocol);
+	if (!gpe->next_protocol)
+		return -EPFNOSUPPORT;
+	return 0;
 }
 
 static int vxlan_build_skb(struct sk_buff *skb, struct dst_entry *dst,
@@ -862,7 +866,8 @@ static int vxlan_build_skb(struct sk_buff *skb, struct dst_entry *dst,
 	if (unlikely(err))
 		goto out_free;
 
-	skb = vlan_hwaccel_push_inside(skb);
+	if (skb_vlan_tag_present(skb))
+		skb = __vlan_hwaccel_push_inside(skb);
 	if (WARN_ON(!skb))
 		return -ENOMEM;
 
@@ -913,6 +918,7 @@ out_free:
 static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
 				      struct sk_buff *skb, int oif, u8 tos,
 				      __be32 daddr, __be32 *saddr,
+				      __be16 dport, __be16 sport,
 				      struct dst_cache *dst_cache,
 				      const struct ip_tunnel_info *info)
 {
@@ -935,6 +941,8 @@ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
 	fl4.flowi4_proto = IPPROTO_UDP;
 	fl4.daddr = daddr;
 	fl4.saddr = *saddr;
+	fl4.fl4_dport = dport;
+	fl4.fl4_sport = sport;
 
 	rt = ip_route_output_key(vxlan->net, &fl4);
 	if (!IS_ERR(rt)) {
@@ -951,6 +959,7 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
 					  __be32 label,
 					  const struct in6_addr *daddr,
 					  struct in6_addr *saddr,
+					  __be16 dport, __be16 sport,
 					  struct dst_cache *dst_cache,
 					  const struct ip_tunnel_info *info)
 {
@@ -978,6 +987,8 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
 	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tos), label);
 	fl6.flowi6_mark = skb->mark;
 	fl6.flowi6_proto = IPPROTO_UDP;
+	fl6.fl6_dport = dport;
+	fl6.fl6_sport = sport;
 
 #ifdef HAVE_IPV6_DST_LOOKUP_NET
 	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
@@ -1090,7 +1101,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		label = info->key.label;
 		udp_sum = !!(info->key.tun_flags & TUNNEL_CSUM);
 
-		if (info->options_len)
+		if (info->options_len &&
+		    info->key.tun_flags & TUNNEL_VXLAN_OPT)
 			md = ip_tunnel_info_opts(info);
 	} else {
 		md->gbp = skb->mark;
@@ -1107,6 +1119,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 				     rdst ? rdst->remote_ifindex : 0, tos,
 				     dst->sin.sin_addr.s_addr,
 				     &src->sin.sin_addr.s_addr,
+				     dst_port, src_port,
 				     dst_cache, info);
 		if (IS_ERR(rt)) {
 			netdev_dbg(dev, "no route to %pI4\n",
@@ -1166,6 +1179,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 					rdst ? rdst->remote_ifindex : 0, tos,
 					label, &dst->sin6.sin6_addr,
 					&src->sin6.sin6_addr,
+					dst_port, src_port,
 					dst_cache, info);
 		if (IS_ERR(ndst)) {
 			netdev_dbg(dev, "no route to %pI6\n",
@@ -1262,9 +1276,15 @@ netdev_tx_t rpl_vxlan_xmit(struct sk_buff *skb)
 EXPORT_SYMBOL_GPL(rpl_vxlan_xmit);
 
 /* Walk the forwarding table and purge stale entries */
+#ifdef HAVE_INIT_TIMER_DEFERRABLE
 static void vxlan_cleanup(unsigned long arg)
 {
 	struct vxlan_dev *vxlan = (struct vxlan_dev *) arg;
+#else
+static void vxlan_cleanup(struct timer_list *t)
+{
+       struct vxlan_dev *vxlan = from_timer(vxlan, t, age_timer);
+#endif
 	unsigned long next_timer = jiffies + FDB_AGE_INTERVAL;
 	unsigned int h;
 
@@ -1456,7 +1476,8 @@ int ovs_vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 			return -EINVAL;
 		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
 				     info->key.u.ipv4.dst,
-				     &info->key.u.ipv4.src, NULL, info);
+				     &info->key.u.ipv4.src,
+				     dport, sport, NULL, info);
 		if (IS_ERR(rt))
 			return PTR_ERR(rt);
 		ip_rt_put(rt);
@@ -1466,7 +1487,8 @@ int ovs_vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 
 		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
 					info->key.label, &info->key.u.ipv6.dst,
-					&info->key.u.ipv6.src, NULL, info);
+					&info->key.u.ipv6.src,
+					dport, sport, NULL, info);
 		if (IS_ERR(ndst))
 			return PTR_ERR(ndst);
 		dst_release(ndst);
@@ -1499,7 +1521,12 @@ static const struct net_device_ops vxlan_netdev_ether_ops = {
 	.ndo_start_xmit		= vxlan_dev_xmit,
 	.ndo_get_stats64	= ip_tunnel_get_stats64,
 	.ndo_set_rx_mode	= vxlan_set_multicast_list,
+#ifdef	HAVE_RHEL7_MAX_MTU
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_change_mtu = vxlan_change_mtu,
+#else
 	.ndo_change_mtu		= vxlan_change_mtu,
+#endif
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= eth_mac_addr,
 #ifdef HAVE_NDO_FILL_METADATA_DST
@@ -1514,7 +1541,12 @@ static const struct net_device_ops vxlan_netdev_raw_ops = {
 	.ndo_stop		= vxlan_stop,
 	.ndo_start_xmit		= vxlan_dev_xmit,
 	.ndo_get_stats64	= ip_tunnel_get_stats64,
+#ifdef	HAVE_RHEL7_MAX_MTU
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_change_mtu = vxlan_change_mtu,
+#else
 	.ndo_change_mtu		= vxlan_change_mtu,
+#endif
 #ifdef HAVE_NDO_FILL_METADATA_DST
 	.ndo_fill_metadata_dst	= ovs_vxlan_fill_metadata_dst,
 #endif
@@ -1525,9 +1557,9 @@ static struct device_type vxlan_type = {
 	.name = "vxlan",
 };
 
-/* Calls the ndo_add_vxlan_port of the caller in order to
- * supply the listening VXLAN udp ports. Callers are expected
- * to implement the ndo_add_vxlan_port.
+/* Calls the ndo_add_vxlan_port or ndo_udp_tunnel_add of the caller
+ * in order to supply the listening VXLAN udp ports. Callers are
+ * expected to implement the ndo_add_vxlan_port.
  */
 static void vxlan_push_rx_ports(struct net_device *dev)
 {
@@ -1552,6 +1584,30 @@ static void vxlan_push_rx_ports(struct net_device *dev)
 		}
 	}
 	spin_unlock(&vn->sock_lock);
+#elif defined(HAVE_NDO_UDP_TUNNEL_ADD)
+	struct vxlan_sock *vs;
+	struct net *net = dev_net(dev);
+	struct vxlan_net *vn = net_generic(net, vxlan_net_id);
+	unsigned int i;
+
+	if (!dev->netdev_ops->ndo_udp_tunnel_add)
+		return;
+
+	spin_lock(&vn->sock_lock);
+	for (i = 0; i < PORT_HASH_SIZE; ++i) {
+		hlist_for_each_entry_rcu(vs, &vn->sock_list[i], hlist) {
+			struct udp_tunnel_info ti;
+			if (vs->flags & VXLAN_F_GPE)
+				ti.type = UDP_TUNNEL_TYPE_VXLAN_GPE;
+			else
+				ti.type = UDP_TUNNEL_TYPE_VXLAN;
+			ti.port = inet_sk(vs->sock->sk)->inet_sport;
+			ti.sa_family = vxlan_get_sk_family(vs);
+
+			dev->netdev_ops->ndo_udp_tunnel_add(dev, &ti);
+		}
+	}
+	spin_unlock(&vn->sock_lock);
 #endif
 }
 
@@ -1564,7 +1620,11 @@ static void vxlan_setup(struct net_device *dev)
 	eth_hw_addr_random(dev);
 	ether_setup(dev);
 
+#ifndef HAVE_NEEDS_FREE_NETDEV
 	dev->destructor = free_netdev;
+#else
+	dev->needs_free_netdev = true;
+#endif
 	SET_NETDEV_DEVTYPE(dev, &vxlan_type);
 
 	dev->features	|= NETIF_F_LLTX;
@@ -1585,9 +1645,13 @@ static void vxlan_setup(struct net_device *dev)
 	INIT_LIST_HEAD(&vxlan->next);
 	spin_lock_init(&vxlan->hash_lock);
 
+#ifdef HAVE_INIT_TIMER_DEFERRABLE
 	init_timer_deferrable(&vxlan->age_timer);
 	vxlan->age_timer.function = vxlan_cleanup;
 	vxlan->age_timer.data = (unsigned long) vxlan;
+#else
+	timer_setup(&vxlan->age_timer, vxlan_cleanup, TIMER_DEFERRABLE);
+#endif
 
 	vxlan->cfg.dst_port = htons(vxlan_port);
 
@@ -1644,7 +1708,12 @@ static const struct nla_policy vxlan_policy[IFLA_VXLAN_MAX + 1] = {
 	[IFLA_VXLAN_REMCSUM_NOPARTIAL]	= { .type = NLA_FLAG },
 };
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[],
+			  struct netlink_ext_ack *extack)
+#else
 static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	if (tb[IFLA_ADDRESS]) {
 		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN) {
@@ -1963,8 +2032,14 @@ static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
 	return 0;
 }
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int vxlan_newlink(struct net *src_net, struct net_device *dev,
+			 struct nlattr *tb[], struct nlattr *data[],
+			 struct netlink_ext_ack *extack)
+#else
 static int vxlan_newlink(struct net *src_net, struct net_device *dev,
 			 struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	pr_info("unsupported operation\n");
 	return -EINVAL;

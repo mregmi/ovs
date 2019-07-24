@@ -99,9 +99,9 @@ enum netdev_pt_mode {
 
 /* Configuration specific to tunnels. */
 struct netdev_tunnel_config {
+    ovs_be64 in_key;
     bool in_key_present;
     bool in_key_flow;
-    ovs_be64 in_key;
 
     bool out_key_present;
     bool out_key_flow;
@@ -115,8 +115,8 @@ struct netdev_tunnel_config {
     struct in6_addr ipv6_dst;
 
     uint32_t exts;
-    bool set_egress_pkt_mark;
     uint32_t egress_pkt_mark;
+    bool set_egress_pkt_mark;
 
     uint8_t ttl;
     bool ttl_inherit;
@@ -127,6 +127,18 @@ struct netdev_tunnel_config {
     bool csum;
     bool dont_fragment;
     enum netdev_pt_mode pt_mode;
+
+    bool set_seq;
+    uint32_t seqno;
+    uint32_t erspan_idx;
+    uint8_t erspan_ver;
+    uint8_t erspan_dir;
+    uint8_t erspan_hwid;
+
+    bool erspan_ver_flow;
+    bool erspan_idx_flow;
+    bool erspan_dir_flow;
+    bool erspan_hwid_flow;
 };
 
 void netdev_run(void);
@@ -171,62 +183,20 @@ enum netdev_pt_mode netdev_get_pt_mode(const struct netdev *);
 /* Packet reception. */
 int netdev_rxq_open(struct netdev *, struct netdev_rxq **, int id);
 void netdev_rxq_close(struct netdev_rxq *);
+bool netdev_rxq_enabled(struct netdev_rxq *);
 
 const char *netdev_rxq_get_name(const struct netdev_rxq *);
 int netdev_rxq_get_queue_id(const struct netdev_rxq *);
 
-int netdev_rxq_recv(struct netdev_rxq *rx, struct dp_packet_batch *);
+int netdev_rxq_recv(struct netdev_rxq *rx, struct dp_packet_batch *,
+                    int *qfill);
 void netdev_rxq_wait(struct netdev_rxq *);
 int netdev_rxq_drain(struct netdev_rxq *);
 
 /* Packet transmission. */
 int netdev_send(struct netdev *, int qid, struct dp_packet_batch *,
-                bool may_steal, bool concurrent_txq);
+                bool concurrent_txq);
 void netdev_send_wait(struct netdev *, int qid);
-
-/* Flow offloading. */
-struct offload_info {
-    const struct dpif_class *dpif_class;
-    ovs_be16 tp_dst_port; /* Destination port for tunnel in SET action */
-};
-struct dpif_class;
-struct netdev_flow_dump;
-int netdev_flow_flush(struct netdev *);
-int netdev_flow_dump_create(struct netdev *, struct netdev_flow_dump **dump);
-int netdev_flow_dump_destroy(struct netdev_flow_dump *);
-bool netdev_flow_dump_next(struct netdev_flow_dump *, struct match *,
-                          struct nlattr **actions, struct dpif_flow_stats *,
-                          ovs_u128 *ufid, struct ofpbuf *rbuffer,
-                          struct ofpbuf *wbuffer);
-int netdev_flow_put(struct netdev *, struct match *, struct nlattr *actions,
-                    size_t actions_len, const ovs_u128 *,
-                    struct offload_info *, struct dpif_flow_stats *);
-int netdev_flow_get(struct netdev *, struct match *, struct nlattr **actions,
-                    const ovs_u128 *, struct dpif_flow_stats *,
-                    struct ofpbuf *wbuffer);
-int netdev_flow_del(struct netdev *, const ovs_u128 *,
-                    struct dpif_flow_stats *);
-int netdev_init_flow_api(struct netdev *);
-bool netdev_is_flow_api_enabled(void);
-void netdev_set_flow_api_enabled(const struct smap *ovs_other_config);
-
-struct dpif_port;
-int netdev_ports_insert(struct netdev *, const struct dpif_class *,
-                        struct dpif_port *);
-struct netdev *netdev_ports_get(odp_port_t port, const struct dpif_class *);
-int netdev_ports_remove(odp_port_t port, const struct dpif_class *);
-odp_port_t netdev_ifindex_to_odp_port(int ifindex);
-struct netdev_flow_dump **netdev_ports_flow_dump_create(
-                                        const struct dpif_class *,
-                                        int *ports);
-void netdev_ports_flow_flush(const struct dpif_class *);
-int netdev_ports_flow_del(const struct dpif_class *, const ovs_u128 *ufid,
-                          struct dpif_flow_stats *stats);
-int netdev_ports_flow_get(const struct dpif_class *, struct match *match,
-                          struct nlattr **actions,
-                          const ovs_u128 *ufid,
-                          struct dpif_flow_stats *stats,
-                          struct ofpbuf *buf);
 
 /* native tunnel APIs */
 /* Structure to pass parameters required to build a tunnel header. */
@@ -282,6 +252,7 @@ void netdev_restore_flags(struct netdev_saved_flags *);
 /* TCP/IP stack interface. */
 int netdev_set_in4(struct netdev *, struct in_addr addr, struct in_addr mask);
 int netdev_get_in4_by_name(const char *device_name, struct in_addr *in4);
+int netdev_get_ip_by_name(const char *device_name, struct in6_addr *);
 int netdev_get_addr_list(const struct netdev *netdev, struct in6_addr **addr,
                          struct in6_addr **mask, int *n_in6);
 
@@ -296,6 +267,8 @@ struct netdev *netdev_find_dev_by_in4(const struct in_addr *);
 
 /* Statistics. */
 int netdev_get_stats(const struct netdev *, struct netdev_stats *);
+int netdev_get_custom_stats(const struct netdev *,
+                            struct netdev_custom_stats *);
 
 /* Quality of service. */
 struct netdev_qos_capabilities {

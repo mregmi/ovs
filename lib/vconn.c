@@ -18,6 +18,7 @@
 #include "vconn-provider.h"
 #include <errno.h>
 #include <inttypes.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@
 #include "openflow/nicira-ext.h"
 #include "openflow/openflow.h"
 #include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofp-bundle.h"
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/ofp-msgs.h"
 #include "openvswitch/ofp-print.h"
@@ -35,7 +37,7 @@
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "util.h"
 #include "socket-util.h"
@@ -137,11 +139,11 @@ vconn_usage(bool active, bool passive, bool bootstrap OVS_UNUSED)
     printf("\n");
     if (active) {
         printf("Active OpenFlow connection methods:\n");
-        printf("  tcp:IP[:PORT]           "
-               "PORT (default: %d) at remote IP\n", OFP_PORT);
+        printf("  tcp:HOST[:PORT]         "
+               "PORT (default: %d) at remote HOST\n", OFP_PORT);
 #ifdef HAVE_OPENSSL
-        printf("  ssl:IP[:PORT]           "
-               "SSL PORT (default: %d) at remote IP\n", OFP_PORT);
+        printf("  ssl:HOST[:PORT]         "
+               "SSL PORT (default: %d) at remote HOST\n", OFP_PORT);
 #endif
         printf("  unix:FILE               Unix domain socket named FILE\n");
     }
@@ -304,7 +306,7 @@ vconn_get_status(const struct vconn *vconn)
 
 int
 vconn_open_block(const char *name, uint32_t allowed_versions, uint8_t dscp,
-                 struct vconn **vconnp)
+                 long long int timeout, struct vconn **vconnp)
 {
     struct vconn *vconn;
     int error;
@@ -313,7 +315,7 @@ vconn_open_block(const char *name, uint32_t allowed_versions, uint8_t dscp,
 
     error = vconn_open(name, allowed_versions, dscp, &vconn);
     if (!error) {
-        error = vconn_connect_block(vconn);
+        error = vconn_connect_block(vconn, timeout);
     }
 
     if (error) {
@@ -495,7 +497,7 @@ vcs_recv_hello(struct vconn *vconn)
             ofpbuf_delete(b);
             return;
         } else {
-            char *s = ofp_to_string(b->data, b->size, NULL, 1);
+            char *s = ofp_to_string(b->data, b->size, NULL, NULL, 1);
             VLOG_WARN_RL(&bad_ofmsg_rl,
                          "%s: received message while expecting hello: %s",
                          vconn->name, s);
@@ -569,6 +571,7 @@ vconn_connect(struct vconn *vconn)
             break;
 
         case VCS_DISCONNECTED:
+            ovs_assert(vconn->error != 0);
             return vconn->error;
 
         default:
@@ -641,7 +644,8 @@ do_recv(struct vconn *vconn, struct ofpbuf **msgp)
     if (!retval) {
         COVERAGE_INC(vconn_received);
         if (VLOG_IS_DBG_ENABLED()) {
-            char *s = ofp_to_string((*msgp)->data, (*msgp)->size, NULL, 1);
+            char *s = ofp_to_string((*msgp)->data, (*msgp)->size,
+                                    NULL, NULL, 1);
             VLOG_DBG_RL(&ofmsg_rl, "%s: received: %s", vconn->name, s);
             free(s);
         }
@@ -681,7 +685,7 @@ do_send(struct vconn *vconn, struct ofpbuf *msg)
         COVERAGE_INC(vconn_sent);
         retval = (vconn->vclass->send)(vconn, msg);
     } else {
-        char *s = ofp_to_string(msg->data, msg->size, NULL, 1);
+        char *s = ofp_to_string(msg->data, msg->size, NULL, NULL, 1);
         retval = (vconn->vclass->send)(vconn, msg);
         if (retval != EAGAIN) {
             VLOG_DBG_RL(&ofmsg_rl, "%s: sent (%s): %s",
@@ -693,16 +697,28 @@ do_send(struct vconn *vconn, struct ofpbuf *msg)
 }
 
 /* Same as vconn_connect(), except that it waits until the connection on
- * 'vconn' completes or fails.  Thus, it will never return EAGAIN. */
+ * 'vconn' completes or fails, but no more than 'timeout' milliseconds.
+ * Thus, it will never return EAGAIN.  Negative value of 'timeout' means
+ * infinite waiting.*/
 int
-vconn_connect_block(struct vconn *vconn)
+vconn_connect_block(struct vconn *vconn, long long int timeout)
 {
-    int error;
+    long long int deadline = (timeout >= 0
+                              ? time_msec() + timeout
+                              : LLONG_MAX);
 
+    int error;
     while ((error = vconn_connect(vconn)) == EAGAIN) {
+        if (time_msec() > deadline) {
+            error = ETIMEDOUT;
+            break;
+        }
         vconn_run(vconn);
         vconn_run_wait(vconn);
         vconn_connect_wait(vconn);
+        if (deadline != LLONG_MAX) {
+            poll_timer_wait_until(deadline);
+        }
         poll_block();
     }
     ovs_assert(error != EINPROGRESS);
@@ -768,7 +784,7 @@ vconn_recv_xid__(struct vconn *vconn, ovs_be32 xid, struct ofpbuf **replyp,
         }
 
         error = ofptype_decode(&type, oh);
-        if (!error && type == OFPTYPE_ERROR) {
+        if (!error && type == OFPTYPE_ERROR && errors) {
             ovs_list_push_back(errors, &reply->list_node);
         } else {
             VLOG_DBG_RL(&bad_ofmsg_rl, "%s: received reply with xid %08"PRIx32
@@ -930,6 +946,46 @@ vconn_transact_multiple_noreply(struct vconn *vconn, struct ovs_list *requests,
     return 0;
 }
 
+/* Sends 'requests' (which should be a multipart request) on 'vconn' and waits
+ * for the replies, which are put into 'replies'.  Returns 0 if successful,
+ * otherwise an errno value. */
+int
+vconn_transact_multipart(struct vconn *vconn,
+                         struct ovs_list *requests,
+                         struct ovs_list *replies)
+{
+    struct ofpbuf *rq = ofpbuf_from_list(ovs_list_front(requests));
+    ovs_be32 send_xid = ((struct ofp_header *) rq->data)->xid;
+
+    ovs_list_init(replies);
+
+    /* Send all the requests. */
+    struct ofpbuf *b, *next;
+    LIST_FOR_EACH_SAFE (b, next, list_node, requests) {
+        ovs_list_remove(&b->list_node);
+        int error = vconn_send_block(vconn, b);
+        if (error) {
+            ofpbuf_delete(b);
+        }
+    }
+
+    /* Receive all the replies. */
+    bool more;
+    do {
+        struct ofpbuf *reply;
+        int error = vconn_recv_xid__(vconn, send_xid, &reply, NULL);
+        if (error) {
+            ofpbuf_list_delete(replies);
+            return error;
+        }
+
+        ovs_list_push_back(replies, &reply->list_node);
+        more = ofpmsg_is_stat_reply(reply->data) && ofpmp_more(reply->data);
+    } while (more);
+
+    return 0;
+}
+
 static int
 recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
                       struct ofpbuf **replyp,
@@ -957,7 +1013,8 @@ recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
             error = ofptype_decode(&type, reply->data);
             if (error || type != OFPTYPE_FLOW_STATS_REPLY) {
                 VLOG_WARN_RL(&rl, "received bad reply: %s",
-                             ofp_to_string(reply->data, reply->size, NULL, 1));
+                             ofp_to_string(reply->data, reply->size,
+                                           NULL, NULL, 1));
                 return EPROTO;
             }
         }
@@ -1403,10 +1460,6 @@ pvconn_close(struct pvconn *pvconn)
 /* Tries to accept a new connection on 'pvconn'.  If successful, stores the new
  * connection in '*new_vconn' and returns 0.  Otherwise, returns a positive
  * errno value.
- *
- * The new vconn will automatically negotiate an OpenFlow protocol version
- * acceptable to both peers on the connection.  The version negotiated will be
- * no lower than 'min_version' and no higher than 'max_version'.
  *
  * pvconn_accept() will not block waiting for a connection.  If no connection
  * is ready to be accepted, it returns EAGAIN immediately. */

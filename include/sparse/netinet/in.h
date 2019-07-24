@@ -18,6 +18,12 @@
 #error "Use this header only with sparse.  It is not a correct implementation."
 #endif
 
+#define NETINET_IN_H_INCLUDED 1
+
+#ifndef SYS_TYPES_H_INCLUDED
+#error "Must include <sys/types.h> before <netinet/in.h> for FreeBSD support"
+#endif
+
 #ifndef _NETINET_IN_H
 #define _NETINET_IN_H 1
 
@@ -116,6 +122,27 @@ struct sockaddr_in6 {
      (X)->s6_addr[9] == 0 &&                    \
      (X)->s6_addr[10] == 0xff &&                \
      (X)->s6_addr[11] == 0xff)
+
+#define IN6_IS_ADDR_MC_LINKLOCAL(a)                 \
+    ((a)->s6_addr[0] == 0xff && ((a)->s6_addr[1] & 0xf) == 0x2)
+
+# define IN6_ARE_ADDR_EQUAL(a, b)               \
+    ((a)->s6_addr[0] == (b)->s6_addr[0] &&      \
+     (a)->s6_addr[1] == (b)->s6_addr[1] &&      \
+     (a)->s6_addr[2] == (b)->s6_addr[2] &&      \
+     (a)->s6_addr[3] == (b)->s6_addr[3] &&      \
+     (a)->s6_addr[4] == (b)->s6_addr[4] &&      \
+     (a)->s6_addr[5] == (b)->s6_addr[5] &&      \
+     (a)->s6_addr[6] == (b)->s6_addr[6] &&      \
+     (a)->s6_addr[7] == (b)->s6_addr[7] &&      \
+     (a)->s6_addr[8] == (b)->s6_addr[8] &&      \
+     (a)->s6_addr[9] == (b)->s6_addr[9] &&      \
+     (a)->s6_addr[10] == (b)->s6_addr[10] &&    \
+     (a)->s6_addr[11] == (b)->s6_addr[11] &&    \
+     (a)->s6_addr[12] == (b)->s6_addr[12] &&    \
+     (a)->s6_addr[13] == (b)->s6_addr[13] &&    \
+     (a)->s6_addr[14] == (b)->s6_addr[14] &&    \
+     (a)->s6_addr[15] == (b)->s6_addr[15])
 
 #define INET_ADDRSTRLEN 16
 #define INET6_ADDRSTRLEN 46

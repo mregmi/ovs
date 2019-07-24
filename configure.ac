@@ -13,7 +13,7 @@
 # limitations under the License.
 
 AC_PREREQ(2.63)
-AC_INIT(openvswitch, 2.8.90, bugs@openvswitch.org)
+AC_INIT(openvswitch, 2.12.90, bugs@openvswitch.org)
 AC_CONFIG_SRCDIR([datapath/datapath.c])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -29,12 +29,6 @@ AC_PROG_MKDIR_P
 AC_PROG_FGREP
 AC_PROG_EGREP
 PKG_PROG_PKG_CONFIG
-
-AC_ARG_VAR([PERL], [path to Perl interpreter])
-AC_PATH_PROG([PERL], perl, no)
-if test "$PERL" = no; then
-   AC_MSG_ERROR([Perl interpreter not found in $PATH or $PERL.])
-fi
 
 AM_MISSING_PROG([AUTOM4TE], [autom4te])
 
@@ -83,10 +77,12 @@ AC_SUBST([LT_AGE])
 AC_SEARCH_LIBS([pow], [m])
 AC_SEARCH_LIBS([clock_gettime], [rt])
 AC_SEARCH_LIBS([timer_create], [rt])
-AC_SEARCH_LIBS([pthread_create], [pthread])
+AC_SEARCH_LIBS([pthread_rwlock_tryrdlock], [pthread])
+AC_SEARCH_LIBS([pthread_rwlockattr_destroy], [pthread])
+AC_SEARCH_LIBS([pthread_spin_lock], [pthread])
+AC_CHECK_FUNCS([pthread_spin_lock])
 AC_FUNC_STRERROR_R
 
-OVS_CHECK_ESX
 OVS_CHECK_WIN64
 OVS_CHECK_WIN32
 OVS_CHECK_VISUAL_STUDIO_DDK
@@ -96,14 +92,15 @@ OVS_CHECK_NETLINK
 OVS_CHECK_OPENSSL
 OVS_CHECK_LIBCAPNG
 OVS_CHECK_LOGDIR
-OVS_CHECK_PYTHON
+OVS_CHECK_PYTHON2
 OVS_CHECK_PYTHON3
+OVS_CHECK_PYTHON
 OVS_CHECK_FLAKE8
 OVS_CHECK_SPHINX
 OVS_CHECK_DOT
-OVS_CHECK_IF_PACKET
 OVS_CHECK_IF_DL
 OVS_CHECK_STRTOK_R
+OVS_CHECK_LINUX_AF_XDP
 AC_CHECK_DECLS([sys_siglist], [], [], [[#include <signal.h>]])
 AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec, struct stat.st_mtimensec],
   [], [], [[#include <sys/stat.h>]])
@@ -111,9 +108,11 @@ AC_CHECK_MEMBERS([struct ifreq.ifr_flagshigh], [], [], [[#include <net/if.h>]])
 AC_CHECK_MEMBERS([struct mmsghdr.msg_len], [], [], [[#include <sys/socket.h>]])
 AC_CHECK_MEMBERS([struct sockaddr_in6.sin6_scope_id], [], [],
   [[#include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>]])
-AC_CHECK_FUNCS([mlockall strnlen getloadavg statvfs getmntent_r sendmmsg])
-AC_CHECK_HEADERS([mntent.h sys/statvfs.h linux/types.h linux/if_ether.h stdatomic.h])
+AC_CHECK_FUNCS([mlockall strnlen getloadavg statvfs getmntent_r sendmmsg clock_gettime])
+AC_CHECK_HEADERS([mntent.h sys/statvfs.h linux/types.h linux/if_ether.h])
+AC_CHECK_HEADERS([linux/net_namespace.h stdatomic.h bits/floatn-common.h])
 AC_CHECK_HEADERS([net/if_mib.h], [], [], [[#include <sys/types.h>
 #include <net/if.h>]])
 
@@ -139,6 +138,7 @@ OVS_CHECK_LINUX_HOST
 OVS_LIBTOOL_VERSIONS
 OVS_CHECK_CXX
 AX_FUNC_POSIX_MEMALIGN
+OVS_CHECK_UNBOUND
 
 OVS_CHECK_INCLUDE_NEXT([stdio.h string.h])
 AC_CONFIG_FILES([
@@ -173,6 +173,11 @@ OVS_ENABLE_OPTION([-Wbool-compare])
 OVS_ENABLE_OPTION([-Wshift-negative-value])
 OVS_ENABLE_OPTION([-Wduplicated-cond])
 OVS_ENABLE_OPTION([-Qunused-arguments])
+OVS_ENABLE_OPTION([-Wshadow])
+OVS_ENABLE_OPTION([-Wmultistatement-macros])
+OVS_ENABLE_OPTION([-Wcast-align=strict])
+OVS_ENABLE_OPTION([-Wno-null-pointer-arithmetic])
+OVS_ENABLE_OPTION([-Warray-bounds-pointer-arithmetic])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused], [HAVE_WNO_UNUSED])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused-parameter], [HAVE_WNO_UNUSED_PARAMETER])
 OVS_ENABLE_WERROR
@@ -183,6 +188,7 @@ AC_ARG_VAR(KARCH, [Kernel Architecture String])
 AC_SUBST(KARCH)
 OVS_CHECK_LINUX
 OVS_CHECK_LINUX_TC
+OVS_CHECK_LINUX_SCTP_CT
 OVS_CHECK_DPDK
 OVS_CHECK_PRAGMA_MESSAGE
 AC_SUBST([OVS_CFLAGS])
@@ -206,6 +212,7 @@ AC_CONFIG_COMMANDS([include/openflow/openflow.h.stamp])
 AC_CONFIG_COMMANDS([utilities/bugtool/dummy], [:])
 AC_CONFIG_COMMANDS([ovn/dummy], [:])
 AC_CONFIG_COMMANDS([ovn/utilities/dummy], [:])
+AC_CONFIG_COMMANDS([ipsec/dummy], [:])
 
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES])
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
+# Copyright (C) 2009-2018 Nicira, Inc.
 #
 # Copying and distribution of this file, with or without modification,
 # are permitted in any medium without royalty provided the copyright
@@ -9,6 +9,7 @@ lib_LTLIBRARIES += lib/libopenvswitch.la
 
 lib_libopenvswitch_la_LIBADD = $(SSL_LIBS)
 lib_libopenvswitch_la_LIBADD += $(CAPNG_LDADD)
+lib_libopenvswitch_la_LIBADD += $(LIBBPF_LDADD)
 
 if WIN32
 lib_libopenvswitch_la_LIBADD += ${PTHREAD_LIBS}
@@ -78,8 +79,12 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/dp-packet.h \
 	lib/dp-packet.c \
 	lib/dpdk.h \
+	lib/dpif-netdev-lookup-generic.c \
 	lib/dpif-netdev.c \
 	lib/dpif-netdev.h \
+	lib/dpif-netdev-private.h \
+	lib/dpif-netdev-perf.c \
+	lib/dpif-netdev-perf.h \
 	lib/dpif-provider.h \
 	lib/dpif.c \
 	lib/dpif.h \
@@ -98,6 +103,7 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/guarded-list.h \
 	lib/hash.c \
 	lib/hash.h \
+	lib/hash-aarch64.h \
 	lib/hindex.c \
 	lib/hindex.h \
 	lib/hmap.c \
@@ -105,6 +111,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/hmapx.h \
 	lib/id-pool.c \
 	lib/id-pool.h \
+	lib/ipf.c \
+	lib/ipf.h \
 	lib/jhash.c \
 	lib/jhash.h \
 	lib/json.c \
@@ -129,8 +137,12 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/meta-flow.c \
 	lib/multipath.c \
 	lib/multipath.h \
+	lib/namemap.c \
 	lib/netdev-dpdk.h \
 	lib/netdev-dummy.c \
+	lib/netdev-offload.c \
+	lib/netdev-offload.h \
+	lib/netdev-offload-provider.h \
 	lib/netdev-provider.h \
 	lib/netdev-vport.c \
 	lib/netdev-vport.h \
@@ -140,6 +152,7 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/netflow.h \
 	lib/netlink.c \
 	lib/netlink.h \
+	lib/netnsid.h \
 	lib/nx-match.c \
 	lib/nx-match.h \
 	lib/object-collection.c \
@@ -149,16 +162,31 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/odp-util.c \
 	lib/odp-util.h \
 	lib/ofp-actions.c \
+	lib/ofp-bundle.c \
+	lib/ofp-connection.c \
 	lib/ofp-ed-props.c \
 	lib/ofp-errors.c \
+	lib/ofp-flow.c \
+	lib/ofp-group.c \
+	lib/ofp-ipfix.c \
+	lib/ofp-match.c \
+	lib/ofp-meter.c \
+	lib/ofp-monitor.c \
 	lib/ofp-msgs.c \
+	lib/ofp-packet.c \
 	lib/ofp-parse.c \
+	lib/ofp-port.c \
 	lib/ofp-print.c \
 	lib/ofp-prop.c \
+	lib/ofp-protocol.c \
+	lib/ofp-queue.c \
+	lib/ofp-switch.c \
+	lib/ofp-table.c \
 	lib/ofp-util.c \
 	lib/ofp-version-opt.h \
 	lib/ofp-version-opt.c \
 	lib/ofpbuf.c \
+	lib/ovs-atomic-c++.h \
 	lib/ovs-atomic-c11.h \
 	lib/ovs-atomic-clang.h \
 	lib/ovs-atomic-flag-gcc4.7+.h \
@@ -196,16 +224,21 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/ovsdb-condition.c \
 	lib/ovsdb-parser.c \
 	lib/ovsdb-parser.h \
+	lib/ovsdb-session.c \
+	lib/ovsdb-session.h \
 	lib/ovsdb-types.c \
 	lib/ovsdb-types.h \
+	lib/ox-stat.c \
+	lib/ox-stat.h \
 	lib/packets.c \
 	lib/packets.h \
 	lib/pcap-file.c \
 	lib/pcap-file.h \
 	lib/perf-counter.h \
 	lib/perf-counter.c \
+	lib/stopwatch.h \
+	lib/stopwatch.c \
 	lib/poll-loop.c \
-	lib/poll-loop.h \
 	lib/process.c \
 	lib/process.h \
 	lib/pvector.c \
@@ -213,7 +246,6 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/random.c \
 	lib/random.h \
 	lib/rconn.c \
-	lib/rconn.h \
 	lib/rculist.h \
 	lib/reconnect.c \
 	lib/reconnect.h \
@@ -257,6 +289,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/syslog-direct.h \
 	lib/syslog-libc.c \
 	lib/syslog-libc.h \
+	lib/syslog-null.c \
+	lib/syslog-null.h \
 	lib/syslog-provider.h \
 	lib/table.c \
 	lib/table.h \
@@ -326,6 +360,8 @@ EXTRA_DIST += \
 
 nodist_lib_libopenvswitch_la_SOURCES = \
 	lib/dirs.c \
+	lib/ovsdb-server-idl.c \
+	lib/ovsdb-server-idl.h \
 	lib/vswitch-idl.c \
 	lib/vswitch-idl.h
 CLEANFILES += $(nodist_lib_libopenvswitch_la_SOURCES)
@@ -361,8 +397,8 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/if-notifier.h \
 	lib/netdev-linux.c \
 	lib/netdev-linux.h \
-	lib/netdev-tc-offloads.c \
-	lib/netdev-tc-offloads.h \
+	lib/netdev-linux-private.h \
+	lib/netdev-offload-tc.c \
 	lib/netlink-conntrack.c \
 	lib/netlink-conntrack.h \
 	lib/netlink-notifier.c \
@@ -378,10 +414,19 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/tc.h
 endif
 
+if HAVE_AF_XDP
+lib_libopenvswitch_la_SOURCES += \
+	lib/netdev-afxdp-pool.c \
+	lib/netdev-afxdp-pool.h \
+	lib/netdev-afxdp.c \
+	lib/netdev-afxdp.h
+endif
+
 if DPDK_NETDEV
 lib_libopenvswitch_la_SOURCES += \
 	lib/dpdk.c \
-	lib/netdev-dpdk.c
+	lib/netdev-dpdk.c \
+	lib/netdev-offload-dpdk.c
 else
 lib_libopenvswitch_la_SOURCES += \
 	lib/dpdk-stub.c
@@ -410,12 +455,6 @@ else
 lib_libopenvswitch_la_SOURCES += lib/async-append-null.c
 endif
 
-if ESX
-lib_libopenvswitch_la_SOURCES += \
-	lib/route-table-stub.c \
-	lib/if-notifier-stub.c
-endif
-
 if HAVE_IF_DL
 lib_libopenvswitch_la_SOURCES += \
 	lib/if-notifier-bsd.c \
@@ -425,18 +464,26 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/route-table-bsd.c
 endif
 
+.PHONY: generate-dhparams-c
 if HAVE_OPENSSL
-lib_libopenvswitch_la_SOURCES += lib/stream-ssl.c
-nodist_lib_libopenvswitch_la_SOURCES += lib/dhparams.c
-lib/dhparams.c: lib/dh1024.pem lib/dh2048.pem lib/dh4096.pem
-	$(AM_V_GEN)(echo '#include "lib/dhparams.h"' &&                 \
-	 openssl dhparam -C -in $(srcdir)/lib/dh1024.pem -noout &&	\
-	 openssl dhparam -C -in $(srcdir)/lib/dh2048.pem -noout &&	\
-	 openssl dhparam -C -in $(srcdir)/lib/dh4096.pem -noout)	\
-	| sed 's/\(get_dh[0-9]*\)()/\1(void)/' > lib/dhparams.c.tmp &&  \
+lib_libopenvswitch_la_SOURCES += lib/stream-ssl.c lib/dhparams.c
+
+# Manually regenerates lib/dhparams.c.  Not normally necessary since
+# lib/dhparams.c is part of the repository and doesn't normally need
+# updates.
+generate-dhparams-c:
+	$(AM_V_GEN)cd $(srcdir) && \
+	build-aux/generate-dhparams-c > lib/dhparams.c.tmp && \
 	mv lib/dhparams.c.tmp lib/dhparams.c
 else
 lib_libopenvswitch_la_SOURCES += lib/stream-nossl.c
+endif
+
+lib_libopenvswitch_la_SOURCES += lib/dns-resolve.h
+if HAVE_UNBOUND
+lib_libopenvswitch_la_SOURCES += lib/dns-resolve.c
+else
+lib_libopenvswitch_la_SOURCES += lib/dns-resolve-stub.c
 endif
 
 pkgconfig_DATA += \
@@ -453,8 +500,10 @@ EXTRA_DIST += \
 	lib/db-ctl-base.xml \
 	lib/ssl.xml \
 	lib/ssl-bootstrap.xml \
+	lib/ssl-peer-ca-cert.xml \
 	lib/table.xml \
-	lib/vlog.xml
+	lib/vlog.xml \
+	lib/unixctl.xml
 
 MAN_FRAGMENTS += \
 	lib/colors.man \
@@ -466,6 +515,8 @@ MAN_FRAGMENTS += \
 	lib/db-ctl-base.man \
 	lib/dpctl.man \
 	lib/memory-unixctl.man \
+	lib/netdev-dpdk-unixctl.man \
+	lib/dpif-netdev-unixctl.man \
 	lib/ofp-version.man \
 	lib/ovs.tmac \
 	lib/service.man \
@@ -518,9 +569,9 @@ CLEANFILES += lib/meta-flow.inc lib/nx-match.inc
 EXTRA_DIST += build-aux/extract-ofp-fields
 
 lib/ofp-actions.inc1: $(srcdir)/build-aux/extract-ofp-actions lib/ofp-actions.c
-	$(AM_V_GEN)$(run_python) $^ --prototypes > $@.tmp && mv $@.tmp $@
+	$(AM_V_GEN)$(run_python) $< prototypes $(srcdir)/lib/ofp-actions.c > $@.tmp && mv $@.tmp $@
 lib/ofp-actions.inc2: $(srcdir)/build-aux/extract-ofp-actions lib/ofp-actions.c
-	$(AM_V_GEN)$(run_python) $^ --definitions > $@.tmp && mv $@.tmp $@
+	$(AM_V_GEN)$(run_python) $< definitions $(srcdir)/lib/ofp-actions.c > $@.tmp && mv $@.tmp $@
 lib/ofp-actions.lo: lib/ofp-actions.inc1 lib/ofp-actions.inc2
 CLEANFILES += lib/ofp-actions.inc1 lib/ofp-actions.inc2
 EXTRA_DIST += build-aux/extract-ofp-actions
@@ -542,6 +593,12 @@ lib/ofp-msgs.lo: lib/ofp-msgs.inc
 CLEANFILES += lib/ofp-msgs.inc
 EXTRA_DIST += build-aux/extract-ofp-msgs
 
+# _server IDL
+OVSIDL_BUILT += lib/ovsdb-server-idl.c lib/ovsdb-server-idl.h lib/ovsdb-server-idl.ovsidl
+EXTRA_DIST += lib/ovsdb-server-idl.ann
+lib/ovsdb-server-idl.ovsidl: ovsdb/_server.ovsschema lib/ovsdb-server-idl.ann
+	$(AM_V_GEN)$(OVSDB_IDLC) annotate $(srcdir)/ovsdb/_server.ovsschema $(srcdir)/lib/ovsdb-server-idl.ann > $@.tmp && mv $@.tmp $@
+
 INSTALL_DATA_LOCAL += lib-install-data-local
 lib-install-data-local:
 	$(MKDIR_P) $(DESTDIR)$(PKIDIR)
@@ -556,3 +613,12 @@ lib/ovs-fields.7: $(srcdir)/build-aux/extract-ofp-fields include/openvswitch/met
             $(srcdir)/lib/meta-flow.xml > $@.tmp
 	$(AM_V_at)mv $@.tmp $@
 EXTRA_DIST += lib/meta-flow.xml
+
+man_MANS += lib/ovs-actions.7
+CLEANFILES += lib/ovs-actions.7
+lib/ovs-actions.7: $(srcdir)/build-aux/extract-ofp-actions lib/ovs-actions.xml
+	$(AM_V_GEN)PYTHONIOENCODING=utf8 $(run_python) $< \
+            --ovs-version=$(VERSION) ovs-actions \
+            $(srcdir)/lib/ovs-actions.xml > $@.tmp
+	$(AM_V_at)mv $@.tmp $@
+EXTRA_DIST += lib/ovs-actions.xml

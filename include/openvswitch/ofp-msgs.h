@@ -45,6 +45,7 @@
 extern "C" {
 #endif
 
+struct hmap;
 struct ovs_list;
 
 /* Raw identifiers for OpenFlow messages.
@@ -165,8 +166,10 @@ enum ofpraw {
 
     /* OFPT 1.0 (11): struct ofp10_flow_removed. */
     OFPRAW_OFPT10_FLOW_REMOVED,
-    /* OFPT 1.1+ (11): struct ofp11_flow_removed, uint8_t[8][]. */
+    /* OFPT 1.1-1.4 (11): struct ofp11_flow_removed, uint8_t[8][]. */
     OFPRAW_OFPT11_FLOW_REMOVED,
+    /* OFPT 1.5+ (11): struct ofp15_flow_removed, uint8_t[8][]. */
+    OFPRAW_OFPT15_FLOW_REMOVED,
     /* NXT 1.0+ (14): struct nx_flow_removed, uint8_t[8][]. */
     OFPRAW_NXT_FLOW_REMOVED,
 
@@ -174,10 +177,8 @@ enum ofpraw {
     OFPRAW_OFPT10_PORT_STATUS,
     /* OFPT 1.1-1.3 (12): struct ofp_port_status, struct ofp11_port. */
     OFPRAW_OFPT11_PORT_STATUS,
-    /* OFPT 1.4-1.5 (12): struct ofp_port_status, struct ofp14_port, uint8_t[8][]. */
+    /* OFPT 1.4+ (12): struct ofp_port_status, struct ofp14_port, uint8_t[8][]. */
     OFPRAW_OFPT14_PORT_STATUS,
-    /* OFPT 1.6+ (12): struct ofp_port_status, struct ofp16_port, uint8_t[8][]. */
-    OFPRAW_OFPT16_PORT_STATUS,
 
     /* OFPT 1.0 (13): struct ofp10_packet_out, uint8_t[]. */
     OFPRAW_OFPT10_PACKET_OUT,
@@ -193,6 +194,8 @@ enum ofpraw {
     /* NXT 1.0+ (13): struct nx_flow_mod, uint8_t[8][]. */
     OFPRAW_NXT_FLOW_MOD,
 
+    /* NXT 1.0 (31): struct ofp15_group_mod, uint8_t[8][]. */
+    OFPRAW_NXT_GROUP_MOD,
     /* OFPT 1.1-1.4 (15): struct ofp11_group_mod, uint8_t[8][]. */
     OFPRAW_OFPT11_GROUP_MOD,
     /* OFPT 1.5+ (15): struct ofp15_group_mod, uint8_t[8][]. */
@@ -202,10 +205,8 @@ enum ofpraw {
     OFPRAW_OFPT10_PORT_MOD,
     /* OFPT 1.1-1.3 (16): struct ofp11_port_mod. */
     OFPRAW_OFPT11_PORT_MOD,
-    /* OFPT 1.4-1.5 (16): struct ofp14_port_mod, uint8_t[8][]. */
+    /* OFPT 1.4+ (16): struct ofp14_port_mod, uint8_t[8][]. */
     OFPRAW_OFPT14_PORT_MOD,
-    /* OFPT 1.6+ (16): struct ofp16_port_mod, uint8_t[8][]. */
-    OFPRAW_OFPT16_PORT_MOD,
 
     /* OFPT 1.1-1.3 (17): struct ofp11_table_mod. */
     OFPRAW_OFPT11_TABLE_MOD,
@@ -262,12 +263,18 @@ enum ofpraw {
     /* OFPT 1.3+ (29): struct ofp13_meter_mod, uint8_t[8][]. */
     OFPRAW_OFPT13_METER_MOD,
 
+    /* ONFT 1.3 (1911): struct ofp14_role_status, uint8_t[8][]. */
+    OFPRAW_ONFT13_ROLE_STATUS,
     /* OFPT 1.4+ (30): struct ofp14_role_status, uint8_t[8][]. */
     OFPRAW_OFPT14_ROLE_STATUS,
 
     /* OFPT 1.4+ (31): struct ofp14_table_status, uint8_t[8][]. */
     OFPRAW_OFPT14_TABLE_STATUS,
 
+    /* NXT 1.0-1.2 (132): struct ofp14_requestforward, uint8_t[8][]. */
+    OFPRAW_NXT_REQUESTFORWARD,
+    /* ONFT 1.3 (2350): struct ofp14_requestforward, uint8_t[8][]. */
+    OFPRAW_ONFT13_REQUESTFORWARD,
     /* OFPT 1.4+ (32): struct ofp14_requestforward, uint8_t[8][]. */
     OFPRAW_OFPT14_REQUESTFORWARD,
 
@@ -300,20 +307,26 @@ enum ofpraw {
     OFPRAW_OFPST10_FLOW_REPLY,
     /* OFPST 1.1-1.2 (1): uint8_t[]. */
     OFPRAW_OFPST11_FLOW_REPLY,
-    /* OFPST 1.3+ (1): uint8_t[]. */
+    /* OFPST 1.3-1.4 (1): uint8_t[]. */
     OFPRAW_OFPST13_FLOW_REPLY,
+    /* OFPST 1.5+ (1): uint8_t[]. */
+    OFPRAW_OFPST15_FLOW_REPLY,
     /* NXST 1.0 (0): uint8_t[]. */
     OFPRAW_NXST_FLOW_REPLY,
 
     /* OFPST 1.0 (2): struct ofp10_flow_stats_request. */
     OFPRAW_OFPST10_AGGREGATE_REQUEST,
-    /* OFPST 1.1+ (2): struct ofp11_flow_stats_request, uint8_t[8][]. */
+    /* OFPST 1.1-1.4 (2): struct ofp11_flow_stats_request, uint8_t[8][]. */
     OFPRAW_OFPST11_AGGREGATE_REQUEST,
+    /* OFPST 1.5+ (2): struct ofp11_flow_stats_request, uint8_t[8][]. */
+    OFPRAW_OFPST15_AGGREGATE_REQUEST,
     /* NXST 1.0 (1): struct nx_flow_stats_request, uint8_t[8][]. */
     OFPRAW_NXST_AGGREGATE_REQUEST,
 
-    /* OFPST 1.0+ (2): struct ofp_aggregate_stats_reply. */
+    /* OFPST 1.0-1.4 (2): struct ofp_aggregate_stats_reply. */
     OFPRAW_OFPST_AGGREGATE_REPLY,
+    /* OFPST 1.5+ (2): uint8_t[] . */
+    OFPRAW_OFPST15_AGGREGATE_REPLY,
     /* NXST 1.0 (1): struct ofp_aggregate_stats_reply. */
     OFPRAW_NXST_AGGREGATE_REPLY,
 
@@ -357,25 +370,37 @@ enum ofpraw {
     /* OFPST 1.4+ (5): uint8_t[8][]. */
     OFPRAW_OFPST14_QUEUE_REPLY,
 
+    /* NXST 1.0 (7): struct ofp11_group_stats_request. */
+    OFPRAW_NXST_GROUP_REQUEST,
     /* OFPST 1.1+ (6): struct ofp11_group_stats_request. */
     OFPRAW_OFPST11_GROUP_REQUEST,
 
+    /* NXST 1.0 (7): uint8_t[8][]. */
+    OFPRAW_NXST_GROUP_REPLY,
     /* OFPST 1.1-1.2 (6): uint8_t[8][]. */
     OFPRAW_OFPST11_GROUP_REPLY,
     /* OFPST 1.3+ (6): uint8_t[8][]. */
     OFPRAW_OFPST13_GROUP_REPLY,
 
+    /* NXST 1.0 (8): struct ofp15_group_desc_request. */
+    OFPRAW_NXST_GROUP_DESC_REQUEST,
     /* OFPST 1.1-1.4 (7): void. */
     OFPRAW_OFPST11_GROUP_DESC_REQUEST,
     /* OFPST 1.5+ (7): struct ofp15_group_desc_request. */
     OFPRAW_OFPST15_GROUP_DESC_REQUEST,
 
+    /* NXST 1.0 (8): uint8_t[8][]. */
+    OFPRAW_NXST_GROUP_DESC_REPLY,
     /* OFPST 1.1+ (7): uint8_t[8][]. */
     OFPRAW_OFPST11_GROUP_DESC_REPLY,
 
+    /* NXST 1.0-1.1 (9): void. */
+    OFPRAW_NXST_GROUP_FEATURES_REQUEST,
     /* OFPST 1.2+ (8): void. */
     OFPRAW_OFPST12_GROUP_FEATURES_REQUEST,
 
+    /* NXST 1.0-1.1 (9): struct ofp12_group_features_stats. */
+    OFPRAW_NXST_GROUP_FEATURES_REPLY,
     /* OFPST 1.2+ (8): struct ofp12_group_features_stats. */
     OFPRAW_OFPST12_GROUP_FEATURES_REPLY,
 
@@ -397,7 +422,7 @@ enum ofpraw {
     /* OFPST 1.3+ (11): struct ofp13_meter_features. */
     OFPRAW_OFPST13_METER_FEATURES_REPLY,
 
-    /* OFPST 1.3+ (12): void. */
+    /* OFPST 1.3+ (12): uint8_t[8][]. */
     OFPRAW_OFPST13_TABLE_FEATURES_REQUEST,
 
     /* OFPST 1.3+ (12): struct ofp13_table_features, uint8_t[8][]. */
@@ -441,13 +466,13 @@ enum ofpraw {
  * Nicira extensions that correspond to standard OpenFlow messages are listed
  * alongside the standard versions above. */
 
-    /* NXT 1.0 (12): struct nx_set_flow_format. */
+    /* NXT 1.0 (12): ovs_be32. */
     OFPRAW_NXT_SET_FLOW_FORMAT,
 
-    /* NXT 1.0+ (15): struct nx_flow_mod_table_id. */
+    /* NXT 1.0+ (15): uint8_t[8]. */
     OFPRAW_NXT_FLOW_MOD_TABLE_ID,
 
-    /* NXT 1.0+ (16): struct nx_set_packet_in_format. */
+    /* NXT 1.0+ (16): ovs_be32. */
     OFPRAW_NXT_SET_PACKET_IN_FORMAT,
 
     /* NXT 1.0+ (18): void. */
@@ -559,11 +584,11 @@ enum ofptype {
                                   * OFPRAW_NXT_PACKET_IN. */
     OFPTYPE_FLOW_REMOVED,        /* OFPRAW_OFPT10_FLOW_REMOVED.
                                   * OFPRAW_OFPT11_FLOW_REMOVED.
+                                  * OFPRAW_OFPT15_FLOW_REMOVED.
                                   * OFPRAW_NXT_FLOW_REMOVED. */
     OFPTYPE_PORT_STATUS,         /* OFPRAW_OFPT10_PORT_STATUS.
                                   * OFPRAW_OFPT11_PORT_STATUS.
-                                  * OFPRAW_OFPT14_PORT_STATUS.
-                                  * OFPRAW_OFPT16_PORT_STATUS. */
+                                  * OFPRAW_OFPT14_PORT_STATUS. */
 
     /* Controller command messages. */
     OFPTYPE_PACKET_OUT,          /* OFPRAW_OFPT10_PACKET_OUT.
@@ -572,12 +597,12 @@ enum ofptype {
     OFPTYPE_FLOW_MOD,            /* OFPRAW_OFPT10_FLOW_MOD.
                                   * OFPRAW_OFPT11_FLOW_MOD.
                                   * OFPRAW_NXT_FLOW_MOD. */
-    OFPTYPE_GROUP_MOD,           /* OFPRAW_OFPT11_GROUP_MOD.
+    OFPTYPE_GROUP_MOD,           /* OFPRAW_NXT_GROUP_MOD.
+                                  * OFPRAW_OFPT11_GROUP_MOD.
                                   * OFPRAW_OFPT15_GROUP_MOD. */
     OFPTYPE_PORT_MOD,            /* OFPRAW_OFPT10_PORT_MOD.
                                   * OFPRAW_OFPT11_PORT_MOD.
-                                  * OFPRAW_OFPT14_PORT_MOD.
-                                  * OFPRAW_OFPT16_PORT_MOD. */
+                                  * OFPRAW_OFPT14_PORT_MOD. */
     OFPTYPE_TABLE_MOD,           /* OFPRAW_OFPT11_TABLE_MOD.
                                   * OFPRAW_OFPT14_TABLE_MOD. */
 
@@ -615,10 +640,13 @@ enum ofptype {
     OFPTYPE_METER_MOD,            /* OFPRAW_OFPT13_METER_MOD. */
 
     /* Controller role change event messages. */
-    OFPTYPE_ROLE_STATUS,          /* OFPRAW_OFPT14_ROLE_STATUS. */
+    OFPTYPE_ROLE_STATUS,          /* OFPRAW_ONFT13_ROLE_STATUS.
+                                   * OFPRAW_OFPT14_ROLE_STATUS. */
 
     /* Request forwarding by the switch. */
-    OFPTYPE_REQUESTFORWARD,       /* OFPRAW_OFPT14_REQUESTFORWARD. */
+    OFPTYPE_REQUESTFORWARD,       /* OFPRAW_NXT_REQUESTFORWARD.
+                                   * OFPRAW_ONFT13_REQUESTFORWARD.
+                                   * OFPRAW_OFPT14_REQUESTFORWARD. */
 
     /* Asynchronous messages. */
     OFPTYPE_TABLE_STATUS,          /* OFPRAW_OFPT14_TABLE_STATUS. */
@@ -638,11 +666,14 @@ enum ofptype {
     OFPTYPE_FLOW_STATS_REPLY,        /* OFPRAW_OFPST10_FLOW_REPLY.
                                       * OFPRAW_OFPST11_FLOW_REPLY.
                                       * OFPRAW_OFPST13_FLOW_REPLY.
+                                      * OFPRAW_OFPST15_FLOW_REPLY.
                                       * OFPRAW_NXST_FLOW_REPLY. */
     OFPTYPE_AGGREGATE_STATS_REQUEST, /* OFPRAW_OFPST10_AGGREGATE_REQUEST.
                                       * OFPRAW_OFPST11_AGGREGATE_REQUEST.
+                                      * OFPRAW_OFPST15_AGGREGATE_REQUEST.
                                       * OFPRAW_NXST_AGGREGATE_REQUEST. */
     OFPTYPE_AGGREGATE_STATS_REPLY,   /* OFPRAW_OFPST_AGGREGATE_REPLY.
+                                      * OFPRAW_OFPST15_AGGREGATE_REPLY.
                                       * OFPRAW_NXST_AGGREGATE_REPLY. */
     OFPTYPE_TABLE_STATS_REQUEST,     /* OFPRAW_OFPST_TABLE_REQUEST. */
     OFPTYPE_TABLE_STATS_REPLY,       /* OFPRAW_OFPST10_TABLE_REPLY.
@@ -662,19 +693,25 @@ enum ofptype {
                                       * OFPRAW_OFPST13_QUEUE_REPLY.
                                       * OFPRAW_OFPST14_QUEUE_REPLY. */
 
-    OFPTYPE_GROUP_STATS_REQUEST,     /* OFPRAW_OFPST11_GROUP_REQUEST. */
+    OFPTYPE_GROUP_STATS_REQUEST,     /* OFPRAW_NXST_GROUP_REQUEST.
+                                      * OFPRAW_OFPST11_GROUP_REQUEST. */
 
-    OFPTYPE_GROUP_STATS_REPLY,       /* OFPRAW_OFPST11_GROUP_REPLY.
+    OFPTYPE_GROUP_STATS_REPLY,       /* OFPRAW_NXST_GROUP_REPLY.
+                                      * OFPRAW_OFPST11_GROUP_REPLY.
                                       * OFPRAW_OFPST13_GROUP_REPLY. */
 
-    OFPTYPE_GROUP_DESC_STATS_REQUEST, /* OFPRAW_OFPST11_GROUP_DESC_REQUEST.
+    OFPTYPE_GROUP_DESC_STATS_REQUEST, /* OFPRAW_NXST_GROUP_DESC_REQUEST.
+                                       * OFPRAW_OFPST11_GROUP_DESC_REQUEST.
                                        * OFPRAW_OFPST15_GROUP_DESC_REQUEST. */
 
-    OFPTYPE_GROUP_DESC_STATS_REPLY,  /* OFPRAW_OFPST11_GROUP_DESC_REPLY. */
+    OFPTYPE_GROUP_DESC_STATS_REPLY,  /* OFPRAW_NXST_GROUP_DESC_REPLY.
+                                      * OFPRAW_OFPST11_GROUP_DESC_REPLY. */
 
-    OFPTYPE_GROUP_FEATURES_STATS_REQUEST, /* OFPRAW_OFPST12_GROUP_FEATURES_REQUEST. */
+    OFPTYPE_GROUP_FEATURES_STATS_REQUEST, /* OFPRAW_NXST_GROUP_FEATURES_REQUEST.
+                                           * OFPRAW_OFPST12_GROUP_FEATURES_REQUEST. */
 
-    OFPTYPE_GROUP_FEATURES_STATS_REPLY, /* OFPRAW_OFPST12_GROUP_FEATURES_REPLY. */
+    OFPTYPE_GROUP_FEATURES_STATS_REPLY, /* OFPRAW_NXST_GROUP_FEATURES_REPLY.
+                                         * OFPRAW_OFPST12_GROUP_FEATURES_REPLY. */
 
     OFPTYPE_METER_STATS_REQUEST,     /* OFPRAW_OFPST13_METER_REQUEST. */
 
@@ -742,6 +779,8 @@ const char *ofptype_get_name(enum ofptype);
 void ofpmsg_update_length(struct ofpbuf *);
 const void *ofpmsg_body(const struct ofp_header *);
 bool ofpmsg_is_stat_request(const struct ofp_header *);
+bool ofpmsg_is_stat_reply(const struct ofp_header *);
+bool ofpmsg_is_stat(const struct ofp_header *);
 
 /* Multipart messages (aka "statistics").
  *
@@ -777,9 +816,26 @@ void ofpmp_postappend(struct ovs_list *, size_t start_ofs);
 enum ofp_version ofpmp_version(struct ovs_list *);
 enum ofpraw ofpmp_decode_raw(struct ovs_list *);
 
-/* Decoding multipart replies. */
+/* Decoding multipart messages. */
 uint16_t ofpmp_flags(const struct ofp_header *);
 bool ofpmp_more(const struct ofp_header *);
+
+/* Multipart request assembler.
+ *
+ * OpenFlow 1.3 and later support making multipart requests that span more than
+ * one OpenFlow message.  These functions reassemble such requests.
+ *
+ * A reassembler is simply an hmap.  The following functions manipulate an hmap
+ * used for this purpose. */
+
+void ofpmp_assembler_clear(struct hmap *assembler);
+
+struct ofpbuf *ofpmp_assembler_run(struct hmap *assembler, long long int now)
+    OVS_WARN_UNUSED_RESULT;
+long long int ofpmp_assembler_wait(struct hmap *assembler);
+
+enum ofperr ofpmp_assembler_execute(struct hmap *assembler, struct ofpbuf *msg,
+                                    struct ovs_list *out, long long int now);
 
 #ifdef __cplusplus
 }

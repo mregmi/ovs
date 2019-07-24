@@ -34,7 +34,7 @@ void stream_usage(const char *name, bool active, bool passive, bool bootstrap);
 /* Bidirectional byte streams. */
 int stream_verify_name(const char *name);
 int stream_open(const char *name, struct stream **, uint8_t dscp);
-int stream_open_block(int error, struct stream **);
+int stream_open_block(int error, long long int timeout, struct stream **);
 void stream_close(struct stream *);
 const char *stream_get_name(const struct stream *);
 int stream_connect(struct stream *);
@@ -78,7 +78,7 @@ int pstream_open_with_default_port(const char *name,
                                    struct pstream **,
                                    uint8_t dscp);
 bool stream_parse_target_with_default_port(const char *target,
-                                           uint16_t default_port,
+                                           int default_port,
                                            struct sockaddr_storage *ss);
 int stream_or_pstream_needs_probes(const char *name);
 

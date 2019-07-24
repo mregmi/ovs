@@ -20,9 +20,9 @@
 #include "bitmap.h"
 #include "byte-order.h"
 #include "compiler.h"
-#include "ovn-dhcp.h"
+#include "ovn-l7.h"
 #include "hash.h"
-#include "logical-fields.h"
+#include "lib/packets.h"
 #include "nx-match.h"
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/hmap.h"
@@ -34,9 +34,12 @@
 #include "ovn/expr.h"
 #include "ovn/lex.h"
 #include "ovn/lib/acl-log.h"
+#include "ovn/lib/extend-table.h"
 #include "packets.h"
 #include "openvswitch/shash.h"
 #include "simap.h"
+#include "uuid.h"
+#include "socket-util.h"
 
 VLOG_DEFINE_THIS_MODULE(actions);
 
@@ -76,7 +79,7 @@ ovnact_init(struct ovnact *ovnact, enum ovnact_type type, size_t len)
 
 static size_t
 encode_start_controller_op(enum action_opcode opcode, bool pause,
-                           struct ofpbuf *ofpacts)
+                           uint32_t meter_id, struct ofpbuf *ofpacts)
 {
     size_t ofs = ofpacts->size;
 
@@ -84,6 +87,7 @@ encode_start_controller_op(enum action_opcode opcode, bool pause,
     oc->max_len = UINT16_MAX;
     oc->reason = OFPR_ACTION;
     oc->pause = pause;
+    oc->meter_id = meter_id;
 
     struct action_header ah = { .opcode = htonl(opcode) };
     ofpbuf_put(ofpacts, &ah, sizeof ah);
@@ -103,7 +107,8 @@ encode_finish_controller_op(size_t ofs, struct ofpbuf *ofpacts)
 static void
 encode_controller_op(enum action_opcode opcode, struct ofpbuf *ofpacts)
 {
-    size_t ofs = encode_start_controller_op(opcode, false, ofpacts);
+    size_t ofs = encode_start_controller_op(opcode, false, NX_CTLR_NO_METER,
+                                            ofpacts);
     encode_finish_controller_op(ofs, ofpacts);
 }
 
@@ -181,12 +186,15 @@ first_ptable(const struct ovnact_encode_params *ep,
             : ep->egress_ptable);
 }
 
+#define MAX_NESTED_ACTION_DEPTH 32
+
 /* Context maintained during ovnacts_parse(). */
 struct action_context {
     const struct ovnact_parse_params *pp; /* Parameters. */
     struct lexer *lexer;        /* Lexer for pulling more tokens. */
     struct ofpbuf *ovnacts;     /* Actions. */
     struct expr *prereqs;       /* Prerequisites to apply to match. */
+    int depth;                  /* Current nested action depth. */
 };
 
 static void parse_actions(struct action_context *, enum lex_type sentinel);
@@ -232,7 +240,8 @@ add_prerequisite(struct action_context *ctx, const char *prerequisite)
     struct expr *expr;
     char *error;
 
-    expr = expr_parse_string(prerequisite, ctx->pp->symtab, NULL, &error);
+    expr = expr_parse_string(prerequisite, ctx->pp->symtab, NULL, NULL, NULL,
+                             &error);
     ovs_assert(!error);
     ctx->prereqs = expr_combine(EXPR_T_AND, ctx->prereqs, expr);
 }
@@ -359,7 +368,13 @@ static void
 parse_LOAD(struct action_context *ctx, const struct expr_field *lhs)
 {
     size_t ofs = ctx->ovnacts->size;
-    struct ovnact_load *load = ovnact_put_LOAD(ctx->ovnacts);
+    struct ovnact_load *load;
+    if (lhs->symbol->ovn_field) {
+        load = ovnact_put_OVNFIELD_LOAD(ctx->ovnacts);
+    } else {
+        load = ovnact_put_LOAD(ctx->ovnacts);
+    }
+
     load->dst = *lhs;
 
     char *error = expr_type_check(lhs, lhs->n_bits, true);
@@ -830,17 +845,6 @@ encode_ct_nat(const struct ovnact_ct_nat *cn,
     ct = ofpacts->header;
     if (cn->ip) {
         ct->flags |= NX_CT_F_COMMIT;
-    } else if (snat && ep->is_gateway_router) {
-        /* For performance reasons, we try to prevent additional
-         * recirculations.  ct_snat which is used in a gateway router
-         * does not need a recirculation.  ct_snat(IP) does need a
-         * recirculation.  ct_snat in a distributed router needs
-         * recirculation regardless of whether an IP address is
-         * specified.
-         * XXX Should we consider a method to let the actions specify
-         * whether an action needs recirculation if there are more use
-         * cases?. */
-        ct->recirc_table = NX_CT_RECIRC_NONE;
     }
     ofpact_finish(ofpacts, &ct->ofpact);
     ofpbuf_push_uninit(ofpacts, ct_offset);
@@ -883,23 +887,62 @@ parse_ct_lb_action(struct action_context *ctx)
 
     if (lexer_match(ctx->lexer, LEX_T_LPAREN)) {
         while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
-            if (ctx->lexer->token.type != LEX_T_INTEGER
-                || mf_subvalue_width(&ctx->lexer->token.value) > 32) {
-                free(dsts);
-                lexer_syntax_error(ctx->lexer, "expecting IPv4 address");
-                return;
-            }
+            struct ovnact_ct_lb_dst dst;
+            if (lexer_match(ctx->lexer, LEX_T_LSQUARE)) {
+                /* IPv6 address and port */
+                if (ctx->lexer->token.type != LEX_T_INTEGER
+                    || ctx->lexer->token.format != LEX_F_IPV6) {
+                    free(dsts);
+                    lexer_syntax_error(ctx->lexer, "expecting IPv6 address");
+                    return;
+                }
+                dst.family = AF_INET6;
+                dst.ipv6 = ctx->lexer->token.value.ipv6;
 
-            /* Parse IP. */
-            ovs_be32 ip = ctx->lexer->token.value.ipv4;
-            lexer_get(ctx->lexer);
+                lexer_get(ctx->lexer);
+                if (!lexer_match(ctx->lexer, LEX_T_RSQUARE)) {
+                    free(dsts);
+                    lexer_syntax_error(ctx->lexer, "no closing square "
+                                                   "bracket");
+                    return;
+                }
+                dst.port = 0;
+                if (lexer_match(ctx->lexer, LEX_T_COLON)
+                    && !action_parse_port(ctx, &dst.port)) {
+                    free(dsts);
+                    return;
+                }
+            } else {
+                if (ctx->lexer->token.type != LEX_T_INTEGER
+                    || (ctx->lexer->token.format != LEX_F_IPV4
+                    && ctx->lexer->token.format != LEX_F_IPV6)) {
+                    free(dsts);
+                    lexer_syntax_error(ctx->lexer, "expecting IP address");
+                    return;
+                }
 
-            /* Parse optional port. */
-            uint16_t port = 0;
-            if (lexer_match(ctx->lexer, LEX_T_COLON)
-                && !action_parse_port(ctx, &port)) {
-                free(dsts);
-                return;
+                /* Parse IP. */
+                if (ctx->lexer->token.format == LEX_F_IPV4) {
+                    dst.family = AF_INET;
+                    dst.ipv4 = ctx->lexer->token.value.ipv4;
+                } else {
+                    dst.family = AF_INET6;
+                    dst.ipv6 = ctx->lexer->token.value.ipv6;
+                }
+
+                lexer_get(ctx->lexer);
+                dst.port = 0;
+                if (lexer_match(ctx->lexer, LEX_T_COLON)) {
+                    if (dst.family == AF_INET6) {
+                        free(dsts);
+                        lexer_syntax_error(ctx->lexer, "IPv6 address needs "
+                                "square brackets if port is included");
+                        return;
+                    } else if (!action_parse_port(ctx, &dst.port)) {
+                        free(dsts);
+                        return;
+                    }
+                }
             }
             lexer_match(ctx->lexer, LEX_T_COMMA);
 
@@ -907,7 +950,7 @@ parse_ct_lb_action(struct action_context *ctx)
             if (n_dsts >= allocated_dsts) {
                 dsts = x2nrealloc(dsts, &allocated_dsts, sizeof *dsts);
             }
-            dsts[n_dsts++] = (struct ovnact_ct_lb_dst) { ip, port };
+            dsts[n_dsts++] = dst;
         }
     }
 
@@ -929,9 +972,19 @@ format_CT_LB(const struct ovnact_ct_lb *cl, struct ds *s)
             }
 
             const struct ovnact_ct_lb_dst *dst = &cl->dsts[i];
-            ds_put_format(s, IP_FMT, IP_ARGS(dst->ip));
-            if (dst->port) {
-                ds_put_format(s, ":%"PRIu16, dst->port);
+            if (dst->family == AF_INET) {
+                ds_put_format(s, IP_FMT, IP_ARGS(dst->ipv4));
+                if (dst->port) {
+                    ds_put_format(s, ":%"PRIu16, dst->port);
+                }
+            } else {
+                if (dst->port) {
+                    ds_put_char(s, '[');
+                }
+                ipv6_format_addr(&dst->ipv6, s);
+                if (dst->port) {
+                    ds_put_format(s, "]:%"PRIu16, dst->port);
+                }
             }
         }
         ds_put_char(s, ')');
@@ -976,14 +1029,13 @@ encode_CT_LB(const struct ovnact_ct_lb *cl,
         return;
     }
 
-    uint32_t group_id = 0, hash;
-    struct group_info *group_info;
+    uint32_t table_id = 0;
     struct ofpact_group *og;
     uint32_t zone_reg = ep->is_switch ? MFF_LOG_CT_ZONE - MFF_REG0
                             : MFF_LOG_DNAT_ZONE - MFF_REG0;
 
     struct ds ds = DS_EMPTY_INITIALIZER;
-    ds_put_format(&ds, "type=select");
+    ds_put_format(&ds, "type=select,selection_method=dp_hash");
 
     BUILD_ASSERT(MFF_LOG_CT_ZONE >= MFF_REG0);
     BUILD_ASSERT(MFF_LOG_CT_ZONE < MFF_REG0 + FLOW_N_REGS);
@@ -991,8 +1043,17 @@ encode_CT_LB(const struct ovnact_ct_lb *cl,
     BUILD_ASSERT(MFF_LOG_DNAT_ZONE < MFF_REG0 + FLOW_N_REGS);
     for (size_t bucket_id = 0; bucket_id < cl->n_dsts; bucket_id++) {
         const struct ovnact_ct_lb_dst *dst = &cl->dsts[bucket_id];
+        char ip_addr[INET6_ADDRSTRLEN];
+        if (dst->family == AF_INET) {
+            inet_ntop(AF_INET, &dst->ipv4, ip_addr, sizeof ip_addr);
+        } else {
+            inet_ntop(AF_INET6, &dst->ipv6, ip_addr, sizeof ip_addr);
+        }
         ds_put_format(&ds, ",bucket=bucket_id=%"PRIuSIZE",weight:100,actions="
-                      "ct(nat(dst="IP_FMT, bucket_id, IP_ARGS(dst->ip));
+                      "ct(nat(dst=%s%s%s", bucket_id,
+                      dst->family == AF_INET6 && dst->port ? "[" : "",
+                      ip_addr,
+                      dst->family == AF_INET6 && dst->port ? "]" : "");
         if (dst->port) {
             ds_put_format(&ds, ":%"PRIu16, dst->port);
         }
@@ -1000,59 +1061,16 @@ encode_CT_LB(const struct ovnact_ct_lb *cl,
                       recirc_table, zone_reg);
     }
 
-    hash = hash_string(ds_cstr(&ds), 0);
-
-    /* Check whether we have non installed but allocated group_id. */
-    HMAP_FOR_EACH_WITH_HASH (group_info, hmap_node, hash,
-                             &ep->group_table->desired_groups) {
-        if (!strcmp(ds_cstr(&group_info->group), ds_cstr(&ds))) {
-            group_id = group_info->group_id;
-            break;
-        }
-    }
-
-    if (!group_id) {
-        /* Check whether we already have an installed entry for this
-         * combination. */
-        HMAP_FOR_EACH_WITH_HASH (group_info, hmap_node, hash,
-                                 &ep->group_table->existing_groups) {
-            if (!strcmp(ds_cstr(&group_info->group), ds_cstr(&ds))) {
-                group_id = group_info->group_id;
-            }
-        }
-
-        bool new_group_id = false;
-        if (!group_id) {
-            /* Reserve a new group_id. */
-            group_id = bitmap_scan(ep->group_table->group_ids, 0, 1,
-                                   MAX_OVN_GROUPS + 1);
-            new_group_id = true;
-        }
-
-        if (group_id == MAX_OVN_GROUPS + 1) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-            VLOG_ERR_RL(&rl, "out of group ids");
-
-            ds_destroy(&ds);
-            return;
-        }
-        bitmap_set1(ep->group_table->group_ids, group_id);
-
-        group_info = xmalloc(sizeof *group_info);
-        group_info->group = ds;
-        group_info->group_id = group_id;
-        group_info->hmap_node.hash = hash;
-        group_info->new_group_id = new_group_id;
-
-        hmap_insert(&ep->group_table->desired_groups,
-                    &group_info->hmap_node, group_info->hmap_node.hash);
-    } else {
-        ds_destroy(&ds);
+    table_id = ovn_extend_table_assign_id(ep->group_table, ds_cstr(&ds),
+                                          ep->lflow_uuid);
+    ds_destroy(&ds);
+    if (table_id == EXT_TABLE_ID_INVALID) {
+        return;
     }
 
     /* Create an action to set the group. */
     og = ofpact_put_GROUP(ofpacts);
-    og->group_id = group_id;
+    og->group_id = table_id;
 }
 
 static void
@@ -1085,6 +1103,11 @@ parse_nested_action(struct action_context *ctx, enum ovnact_type type,
         return;
     }
 
+    if (ctx->depth + 1 == MAX_NESTED_ACTION_DEPTH) {
+        lexer_error(ctx->lexer, "maximum depth of nested actions reached");
+        return;
+    }
+
     uint64_t stub[1024 / 8];
     struct ofpbuf nested = OFPBUF_STUB_INITIALIZER(stub);
 
@@ -1093,6 +1116,7 @@ parse_nested_action(struct action_context *ctx, enum ovnact_type type,
         .lexer = ctx->lexer,
         .ovnacts = &nested,
         .prereqs = NULL,
+        .depth = ctx->depth + 1,
     };
     parse_actions(&inner_ctx, LEX_T_RCURLY);
 
@@ -1127,9 +1151,45 @@ parse_ARP(struct action_context *ctx)
 }
 
 static void
+parse_ICMP4(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ICMP4, "ip4");
+}
+
+static void
+parse_ICMP4_ERROR(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ICMP4_ERROR, "ip4");
+}
+
+static void
+parse_ICMP6(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ICMP6, "ip6");
+}
+
+static void
+parse_TCP_RESET(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_TCP_RESET, "tcp");
+}
+
+static void
 parse_ND_NA(struct action_context *ctx)
 {
     parse_nested_action(ctx, OVNACT_ND_NA, "nd_ns");
+}
+
+static void
+parse_ND_NA_ROUTER(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ND_NA_ROUTER, "nd_ns");
+}
+
+static void
+parse_ND_NS(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ND_NS, "ip6");
 }
 
 static void
@@ -1154,9 +1214,51 @@ format_ARP(const struct ovnact_nest *nest, struct ds *s)
 }
 
 static void
+format_ICMP4(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "icmp4", s);
+}
+
+static void
+format_ICMP4_ERROR(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "icmp4_error", s);
+}
+
+static void
+format_ICMP6(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "icmp6", s);
+}
+
+static void
+format_IGMP(const struct ovnact_null *a OVS_UNUSED, struct ds *s)
+{
+    ds_put_cstr(s, "igmp;");
+}
+
+static void
+format_TCP_RESET(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "tcp_reset", s);
+}
+
+static void
 format_ND_NA(const struct ovnact_nest *nest, struct ds *s)
 {
     format_nested_action(nest, "nd_na", s);
+}
+
+static void
+format_ND_NA_ROUTER(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "nd_na_router", s);
+}
+
+static void
+format_ND_NS(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "nd_ns", s);
 }
 
 static void
@@ -1166,10 +1268,25 @@ format_CLONE(const struct ovnact_nest *nest, struct ds *s)
 }
 
 static void
-encode_nested_neighbor_actions(const struct ovnact_nest *on,
-                               const struct ovnact_encode_params *ep,
-                               enum action_opcode opcode,
-                               struct ofpbuf *ofpacts)
+format_TRIGGER_EVENT(const struct ovnact_controller_event *event,
+                     struct ds *s)
+{
+    ds_put_format(s, "trigger_event(event = \"%s\"",
+                  event_to_string(event->event_type));
+    for (const struct ovnact_gen_option *o = event->options;
+         o < &event->options[event->n_options]; o++) {
+        ds_put_cstr(s, ", ");
+        ds_put_format(s, "%s = ", o->option->name);
+        expr_constant_set_format(&o->value, s);
+    }
+    ds_put_cstr(s, ");");
+}
+
+static void
+encode_nested_actions(const struct ovnact_nest *on,
+                      const struct ovnact_encode_params *ep,
+                      enum action_opcode opcode,
+                      struct ofpbuf *ofpacts)
 {
     /* Convert nested actions into ofpacts. */
     uint64_t inner_ofpacts_stub[1024 / 8];
@@ -1180,7 +1297,8 @@ encode_nested_neighbor_actions(const struct ovnact_nest *on,
      * converted to OpenFlow, as its userdata.  ovn-controller will convert the
      * packet to ARP or NA and then send the packet and actions back to the
      * switch inside an OFPT_PACKET_OUT message. */
-    size_t oc_offset = encode_start_controller_op(opcode, false, ofpacts);
+    size_t oc_offset = encode_start_controller_op(opcode, false,
+                                                  NX_CTLR_NO_METER, ofpacts);
     ofpacts_put_openflow_actions(inner_ofpacts.data, inner_ofpacts.size,
                                  ofpacts, OFP13_VERSION);
     encode_finish_controller_op(oc_offset, ofpacts);
@@ -1194,7 +1312,47 @@ encode_ARP(const struct ovnact_nest *on,
            const struct ovnact_encode_params *ep,
            struct ofpbuf *ofpacts)
 {
-    encode_nested_neighbor_actions(on, ep, ACTION_OPCODE_ARP, ofpacts);
+    encode_nested_actions(on, ep, ACTION_OPCODE_ARP, ofpacts);
+}
+
+static void
+encode_ICMP4(const struct ovnact_nest *on,
+             const struct ovnact_encode_params *ep,
+             struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ICMP, ofpacts);
+}
+
+static void
+encode_ICMP4_ERROR(const struct ovnact_nest *on,
+                   const struct ovnact_encode_params *ep,
+                   struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ICMP4_ERROR, ofpacts);
+}
+
+static void
+encode_ICMP6(const struct ovnact_nest *on,
+             const struct ovnact_encode_params *ep,
+             struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ICMP, ofpacts);
+}
+
+static void
+encode_IGMP(const struct ovnact_null *a OVS_UNUSED,
+            const struct ovnact_encode_params *ep OVS_UNUSED,
+            struct ofpbuf *ofpacts)
+{
+    encode_controller_op(ACTION_OPCODE_IGMP, ofpacts);
+}
+
+static void
+encode_TCP_RESET(const struct ovnact_nest *on,
+                 const struct ovnact_encode_params *ep,
+                 struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_TCP_RESET, ofpacts);
 }
 
 static void
@@ -1202,7 +1360,23 @@ encode_ND_NA(const struct ovnact_nest *on,
              const struct ovnact_encode_params *ep,
              struct ofpbuf *ofpacts)
 {
-    encode_nested_neighbor_actions(on, ep, ACTION_OPCODE_ND_NA, ofpacts);
+    encode_nested_actions(on, ep, ACTION_OPCODE_ND_NA, ofpacts);
+}
+
+static void
+encode_ND_NA_ROUTER(const struct ovnact_nest *on,
+             const struct ovnact_encode_params *ep,
+             struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ND_NA_ROUTER, ofpacts);
+}
+
+static void
+encode_ND_NS(const struct ovnact_nest *on,
+             const struct ovnact_encode_params *ep,
+             struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ND_NS, ofpacts);
 }
 
 static void
@@ -1217,6 +1391,52 @@ encode_CLONE(const struct ovnact_nest *on,
     struct ofpact_nest *clone = ofpbuf_at_assert(ofpacts, ofs, sizeof *clone);
     ofpacts->header = clone;
     ofpact_finish_CLONE(ofpacts, &clone);
+}
+
+static void
+encode_event_empty_lb_backends_opts(struct ofpbuf *ofpacts,
+        const struct ovnact_controller_event *event)
+{
+    for (const struct ovnact_gen_option *o = event->options;
+         o < &event->options[event->n_options]; o++) {
+        struct controller_event_opt_header *hdr =
+            ofpbuf_put_uninit(ofpacts, sizeof *hdr);
+        const union expr_constant *c = o->value.values;
+        size_t size;
+        hdr->opt_code = htons(o->option->code);
+        if (!strcmp(o->option->type, "str")) {
+            size = strlen(c->string);
+            hdr->size = htons(size);
+            ofpbuf_put(ofpacts, c->string, size);
+        } else {
+            /* All empty_lb_backends fields are of type 'str' */
+            OVS_NOT_REACHED();
+        }
+    }
+}
+
+static void
+encode_TRIGGER_EVENT(const struct ovnact_controller_event *event,
+                     const struct ovnact_encode_params *ep OVS_UNUSED,
+                     struct ofpbuf *ofpacts)
+{
+    size_t oc_offset;
+
+    oc_offset = encode_start_controller_op(ACTION_OPCODE_EVENT, false,
+                                           NX_CTLR_NO_METER, ofpacts);
+    ovs_be32 ofs = htonl(event->event_type);
+    ofpbuf_put(ofpacts, &ofs, sizeof ofs);
+
+    switch (event->event_type) {
+    case OVN_EVENT_EMPTY_LB_BACKENDS:
+        encode_event_empty_lb_backends_opts(ofpacts, event);
+        break;
+    case OVN_EVENT_MAX:
+    default:
+        OVS_NOT_REACHED();
+    }
+
+    encode_finish_controller_op(oc_offset, ofpacts);
 }
 
 static void
@@ -1374,19 +1594,17 @@ ovnact_put_mac_bind_free(struct ovnact_put_mac_bind *put_mac OVS_UNUSED)
 }
 
 static void
-parse_dhcp_opt(struct action_context *ctx, struct ovnact_dhcp_option *o,
-               bool v6)
+parse_gen_opt(struct action_context *ctx, struct ovnact_gen_option *o,
+              const struct hmap *gen_opts, const char *opts_type)
 {
     if (ctx->lexer->token.type != LEX_T_ID) {
         lexer_syntax_error(ctx->lexer, NULL);
         return;
     }
 
-    const char *name = v6 ? "DHCPv6" : "DHCPv4";
-    const struct hmap *map = v6 ? ctx->pp->dhcpv6_opts : ctx->pp->dhcp_opts;
-    o->option = map ? dhcp_opts_find(map, ctx->lexer->token.s) : NULL;
+    o->option = gen_opts ? gen_opts_find(gen_opts, ctx->lexer->token.s) : NULL;
     if (!o->option) {
-        lexer_syntax_error(ctx->lexer, "expecting %s option name", name);
+        lexer_syntax_error(ctx->lexer, "expecting %s option name", opts_type);
         return;
     }
     lexer_get(ctx->lexer);
@@ -1403,22 +1621,22 @@ parse_dhcp_opt(struct action_context *ctx, struct ovnact_dhcp_option *o,
     if (!strcmp(o->option->type, "str")) {
         if (o->value.type != EXPR_C_STRING) {
             lexer_error(ctx->lexer, "%s option %s requires string value.",
-                        name, o->option->name);
+                        opts_type, o->option->name);
             return;
         }
     } else {
         if (o->value.type != EXPR_C_INTEGER) {
             lexer_error(ctx->lexer, "%s option %s requires numeric value.",
-                        name, o->option->name);
+                        opts_type, o->option->name);
             return;
         }
     }
 }
 
-static const struct ovnact_dhcp_option *
-find_offerip(const struct ovnact_dhcp_option *options, size_t n)
+static const struct ovnact_gen_option *
+find_offerip(const struct ovnact_gen_option *options, size_t n)
 {
-    for (const struct ovnact_dhcp_option *o = options; o < &options[n]; o++) {
+    for (const struct ovnact_gen_option *o = options; o < &options[n]; o++) {
         if (o->option->code == 0) {
             return o;
         }
@@ -1427,23 +1645,131 @@ find_offerip(const struct ovnact_dhcp_option *options, size_t n)
 }
 
 static void
-free_dhcp_options(struct ovnact_dhcp_option *options, size_t n)
+free_gen_options(struct ovnact_gen_option *options, size_t n)
 {
-    for (struct ovnact_dhcp_option *o = options; o < &options[n]; o++) {
+    for (struct ovnact_gen_option *o = options; o < &options[n]; o++) {
         expr_constant_set_destroy(&o->value);
     }
     free(options);
 }
 
-/* Parses the "put_dhcp_opts" and "put_dhcpv6_opts" actions.
- *
- * The caller has already consumed "<dst> =", so this just parses the rest. */
 static void
-parse_put_dhcp_opts(struct action_context *ctx,
-                    const struct expr_field *dst,
-                    struct ovnact_put_dhcp_opts *pdo)
+validate_empty_lb_backends(struct action_context *ctx,
+                           const struct ovnact_gen_option *options,
+                           size_t n_options)
 {
-    lexer_get(ctx->lexer); /* Skip put_dhcp[v6]_opts. */
+    for (const struct ovnact_gen_option *o = options;
+         o < &options[n_options]; o++) {
+        const union expr_constant *c = o->value.values;
+        struct sockaddr_storage ss;
+        struct uuid uuid;
+
+        if (o->value.n_values > 1 || !c->string) {
+            lexer_error(ctx->lexer, "Invalid value for \"%s\" option",
+                        o->option->name);
+            return;
+        }
+
+        switch (o->option->code) {
+        case EMPTY_LB_VIP:
+            if (!inet_parse_active(c->string, 0, &ss, false)) {
+                lexer_error(ctx->lexer, "Invalid load balancer VIP '%s'",
+                            c->string);
+                return;
+            }
+            break;
+        case EMPTY_LB_PROTOCOL:
+            if (strcmp(c->string, "tcp") && strcmp(c->string, "udp")) {
+                lexer_error(ctx->lexer,
+                    "Load balancer protocol '%s' is not 'tcp' or 'udp'",
+                    c->string);
+                return;
+            }
+            break;
+        case EMPTY_LB_LOAD_BALANCER:
+            if (!uuid_from_string(&uuid, c->string)) {
+                lexer_error(ctx->lexer, "Load balancer '%s' is not a UUID",
+                            c->string);
+                return;
+            }
+            break;
+        }
+    }
+}
+
+static void
+parse_trigger_event(struct action_context *ctx,
+                    struct ovnact_controller_event *event)
+{
+    int event_type = 0;
+
+    lexer_force_match(ctx->lexer, LEX_T_LPAREN);
+
+    /* Event type must be listed first */
+    if (!lexer_match_id(ctx->lexer, "event")) {
+        lexer_syntax_error(ctx->lexer, "Expecting 'event' option");
+        return;
+    }
+    if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
+        return;
+    }
+
+    if (ctx->lexer->token.type != LEX_T_STRING ||
+        strlen(ctx->lexer->token.s) >= 64) {
+        lexer_syntax_error(ctx->lexer, "Expecting string");
+        return;
+    }
+
+    event_type = string_to_event(ctx->lexer->token.s);
+    if (event_type < 0 || event_type >= OVN_EVENT_MAX) {
+        lexer_syntax_error(ctx->lexer, "Unknown event '%d'", event_type);
+        return;
+    }
+
+    event->event_type = event_type;
+    lexer_get(ctx->lexer);
+
+    lexer_match(ctx->lexer, LEX_T_COMMA);
+
+    size_t allocated_options = 0;
+    while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+        if (event->n_options >= allocated_options) {
+            event->options = x2nrealloc(event->options, &allocated_options,
+                                     sizeof *event->options);
+        }
+
+        struct ovnact_gen_option *o = &event->options[event->n_options++];
+        memset(o, 0, sizeof *o);
+        parse_gen_opt(ctx, o,
+                      &ctx->pp->controller_event_opts->event_opts[event_type],
+                      event_to_string(event_type));
+        if (ctx->lexer->error) {
+            return;
+        }
+
+        lexer_match(ctx->lexer, LEX_T_COMMA);
+    }
+
+    switch (event_type) {
+    case OVN_EVENT_EMPTY_LB_BACKENDS:
+        validate_empty_lb_backends(ctx, event->options, event->n_options);
+        break;
+    default:
+        OVS_NOT_REACHED();
+    }
+}
+
+static void
+ovnact_controller_event_free(struct ovnact_controller_event *event OVS_UNUSED)
+{
+}
+
+static void
+parse_put_opts(struct action_context *ctx, const struct expr_field *dst,
+               struct ovnact_put_opts *po, const struct hmap *gen_opts,
+               const char *opts_type)
+{
+    lexer_get(ctx->lexer); /* Skip put_dhcp[v6]_opts / put_nd_ra_opts. */
     lexer_get(ctx->lexer); /* Skip '('. */
 
     /* Validate that the destination is a 1-bit, modifiable field. */
@@ -1453,27 +1779,44 @@ parse_put_dhcp_opts(struct action_context *ctx,
         free(error);
         return;
     }
-    pdo->dst = *dst;
+    po->dst = *dst;
 
     size_t allocated_options = 0;
     while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
-        if (pdo->n_options >= allocated_options) {
-            pdo->options = x2nrealloc(pdo->options, &allocated_options,
-                                      sizeof *pdo->options);
+        if (po->n_options >= allocated_options) {
+            po->options = x2nrealloc(po->options, &allocated_options,
+                                     sizeof *po->options);
         }
 
-        struct ovnact_dhcp_option *o = &pdo->options[pdo->n_options++];
+        struct ovnact_gen_option *o = &po->options[po->n_options++];
         memset(o, 0, sizeof *o);
-        parse_dhcp_opt(ctx, o, pdo->ovnact.type == OVNACT_PUT_DHCPV6_OPTS);
+        parse_gen_opt(ctx, o, gen_opts, opts_type);
         if (ctx->lexer->error) {
             return;
         }
 
         lexer_match(ctx->lexer, LEX_T_COMMA);
     }
+}
 
-    if (pdo->ovnact.type == OVNACT_PUT_DHCPV4_OPTS
-        && !find_offerip(pdo->options, pdo->n_options)) {
+/* Parses the "put_dhcp_opts" and "put_dhcpv6_opts" actions.
+ *
+ * The caller has already consumed "<dst> =", so this just parses the rest. */
+static void
+parse_put_dhcp_opts(struct action_context *ctx,
+                    const struct expr_field *dst,
+                    struct ovnact_put_opts *po)
+{
+    const struct hmap *dhcp_opts =
+        (po->ovnact.type == OVNACT_PUT_DHCPV6_OPTS) ?
+            ctx->pp->dhcpv6_opts : ctx->pp->dhcp_opts;
+    const char *opts_type =
+        (po->ovnact.type == OVNACT_PUT_DHCPV6_OPTS) ? "DHCPv6" : "DHCPv4";
+
+    parse_put_opts(ctx, dst, po, dhcp_opts, opts_type);
+
+    if (!ctx->lexer->error && po->ovnact.type == OVNACT_PUT_DHCPV4_OPTS
+        && !find_offerip(po->options, po->n_options)) {
         lexer_error(ctx->lexer,
                     "put_dhcp_opts requires offerip to be specified.");
         return;
@@ -1481,12 +1824,12 @@ parse_put_dhcp_opts(struct action_context *ctx,
 }
 
 static void
-format_put_dhcp_opts(const char *name,
-                     const struct ovnact_put_dhcp_opts *pdo, struct ds *s)
+format_put_opts(const char *name, const struct ovnact_put_opts *pdo,
+                struct ds *s)
 {
     expr_field_format(&pdo->dst, s);
     ds_put_format(s, " = %s(", name);
-    for (const struct ovnact_dhcp_option *o = pdo->options;
+    for (const struct ovnact_gen_option *o = pdo->options;
          o < &pdo->options[pdo->n_options]; o++) {
         if (o != pdo->options) {
             ds_put_cstr(s, ", ");
@@ -1498,19 +1841,19 @@ format_put_dhcp_opts(const char *name,
 }
 
 static void
-format_PUT_DHCPV4_OPTS(const struct ovnact_put_dhcp_opts *pdo, struct ds *s)
+format_PUT_DHCPV4_OPTS(const struct ovnact_put_opts *pdo, struct ds *s)
 {
-    format_put_dhcp_opts("put_dhcp_opts", pdo, s);
+    format_put_opts("put_dhcp_opts", pdo, s);
 }
 
 static void
-format_PUT_DHCPV6_OPTS(const struct ovnact_put_dhcp_opts *pdo, struct ds *s)
+format_PUT_DHCPV6_OPTS(const struct ovnact_put_opts *pdo, struct ds *s)
 {
-    format_put_dhcp_opts("put_dhcpv6_opts", pdo, s);
+    format_put_opts("put_dhcpv6_opts", pdo, s);
 }
 
 static void
-encode_put_dhcpv4_option(const struct ovnact_dhcp_option *o,
+encode_put_dhcpv4_option(const struct ovnact_gen_option *o,
                          struct ofpbuf *ofpacts)
 {
     uint8_t *opt_header = ofpbuf_put_zeros(ofpacts, 2);
@@ -1550,7 +1893,7 @@ encode_put_dhcpv4_option(const struct ovnact_dhcp_option *o,
             if (c[i].masked) {
                 plen = (uint8_t) ip_count_cidr_bits(c[i].mask.ipv4);
             }
-            opt_header[1] += (1 + (plen / 8) + sizeof(ovs_be32)) ;
+            opt_header[1] += (1 + DIV_ROUND_UP(plen, 8) + sizeof(ovs_be32));
         }
 
         /* Copied from RFC 3442. Please refer to this RFC for the format of
@@ -1575,7 +1918,7 @@ encode_put_dhcpv4_option(const struct ovnact_dhcp_option *o,
                 plen = ip_count_cidr_bits(c[i].mask.ipv4);
             }
             ofpbuf_put(ofpacts, &plen, 1);
-            ofpbuf_put(ofpacts, &c[i].value.ipv4, plen / 8);
+            ofpbuf_put(ofpacts, &c[i].value.ipv4, DIV_ROUND_UP(plen, 8));
             ofpbuf_put(ofpacts, &c[i + 1].value.ipv4,
                        sizeof(ovs_be32));
         }
@@ -1586,7 +1929,7 @@ encode_put_dhcpv4_option(const struct ovnact_dhcp_option *o,
 }
 
 static void
-encode_put_dhcpv6_option(const struct ovnact_dhcp_option *o,
+encode_put_dhcpv6_option(const struct ovnact_gen_option *o,
                          struct ofpbuf *ofpacts)
 {
     struct dhcp_opt6_header *opt = ofpbuf_put_uninit(ofpacts, sizeof *opt);
@@ -1614,14 +1957,15 @@ encode_put_dhcpv6_option(const struct ovnact_dhcp_option *o,
 }
 
 static void
-encode_PUT_DHCPV4_OPTS(const struct ovnact_put_dhcp_opts *pdo,
+encode_PUT_DHCPV4_OPTS(const struct ovnact_put_opts *pdo,
                        const struct ovnact_encode_params *ep OVS_UNUSED,
                        struct ofpbuf *ofpacts)
 {
     struct mf_subfield dst = expr_resolve_field(&pdo->dst);
 
     size_t oc_offset = encode_start_controller_op(ACTION_OPCODE_PUT_DHCP_OPTS,
-                                                  true, ofpacts);
+                                                  true, NX_CTLR_NO_METER,
+                                                  ofpacts);
     nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
@@ -1629,12 +1973,12 @@ encode_PUT_DHCPV4_OPTS(const struct ovnact_put_dhcp_opts *pdo,
     /* Encode the offerip option first, because it's a special case and needs
      * to be first in the actual DHCP response, and then encode the rest
      * (skipping offerip the second time around). */
-    const struct ovnact_dhcp_option *offerip_opt = find_offerip(
+    const struct ovnact_gen_option *offerip_opt = find_offerip(
         pdo->options, pdo->n_options);
     ovs_be32 offerip = offerip_opt->value.values[0].value.ipv4;
     ofpbuf_put(ofpacts, &offerip, sizeof offerip);
 
-    for (const struct ovnact_dhcp_option *o = pdo->options;
+    for (const struct ovnact_gen_option *o = pdo->options;
          o < &pdo->options[pdo->n_options]; o++) {
         if (o != offerip_opt) {
             encode_put_dhcpv4_option(o, ofpacts);
@@ -1645,19 +1989,19 @@ encode_PUT_DHCPV4_OPTS(const struct ovnact_put_dhcp_opts *pdo,
 }
 
 static void
-encode_PUT_DHCPV6_OPTS(const struct ovnact_put_dhcp_opts *pdo,
+encode_PUT_DHCPV6_OPTS(const struct ovnact_put_opts *pdo,
                        const struct ovnact_encode_params *ep OVS_UNUSED,
                        struct ofpbuf *ofpacts)
 {
     struct mf_subfield dst = expr_resolve_field(&pdo->dst);
 
     size_t oc_offset = encode_start_controller_op(
-        ACTION_OPCODE_PUT_DHCPV6_OPTS, true, ofpacts);
+        ACTION_OPCODE_PUT_DHCPV6_OPTS, true, NX_CTLR_NO_METER, ofpacts);
     nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
 
-    for (const struct ovnact_dhcp_option *o = pdo->options;
+    for (const struct ovnact_gen_option *o = pdo->options;
          o < &pdo->options[pdo->n_options]; o++) {
         encode_put_dhcpv6_option(o, ofpacts);
     }
@@ -1666,9 +2010,9 @@ encode_PUT_DHCPV6_OPTS(const struct ovnact_put_dhcp_opts *pdo,
 }
 
 static void
-ovnact_put_dhcp_opts_free(struct ovnact_put_dhcp_opts *pdo)
+ovnact_put_opts_free(struct ovnact_put_opts *pdo)
 {
-    free_dhcp_options(pdo->options, pdo->n_options);
+    free_gen_options(pdo->options, pdo->n_options);
 }
 
 static void
@@ -1747,7 +2091,8 @@ encode_DNS_LOOKUP(const struct ovnact_dns_lookup *dl,
     struct mf_subfield dst = expr_resolve_field(&dl->dst);
 
     size_t oc_offset = encode_start_controller_op(ACTION_OPCODE_DNS_LOOKUP,
-                                                  true, ofpacts);
+                                                  true, NX_CTLR_NO_METER,
+                                                  ofpacts);
     nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
@@ -1759,6 +2104,183 @@ static void
 ovnact_dns_lookup_free(struct ovnact_dns_lookup *dl OVS_UNUSED)
 {
 }
+
+/* Parses the "put_nd_ra_opts" action.
+ * The caller has already consumed "<dst> =", so this just parses the rest. */
+static void
+parse_put_nd_ra_opts(struct action_context *ctx, const struct expr_field *dst,
+                     struct ovnact_put_opts *po)
+{
+    parse_put_opts(ctx, dst, po, ctx->pp->nd_ra_opts, "IPv6 ND RA");
+
+    if (ctx->lexer->error) {
+        return;
+    }
+
+    bool addr_mode_stateful = false;
+    bool prefix_set = false;
+    bool slla_present = false;
+    /* Let's validate the options. */
+    for (struct ovnact_gen_option *o = po->options;
+            o < &po->options[po->n_options]; o++) {
+        const union expr_constant *c = o->value.values;
+        if (o->value.n_values > 1) {
+            lexer_error(ctx->lexer, "Invalid value for \"%s\" option",
+                        o->option->name);
+            return;
+        }
+
+        bool ok = true;
+        switch (o->option->code) {
+        case ND_RA_FLAG_ADDR_MODE:
+            ok = (c->string && (!strcmp(c->string, "slaac") ||
+                                !strcmp(c->string, "dhcpv6_stateful") ||
+                                !strcmp(c->string, "dhcpv6_stateless")));
+            if (ok && !strcmp(c->string, "dhcpv6_stateful")) {
+                addr_mode_stateful = true;
+            }
+            break;
+
+        case ND_OPT_SOURCE_LINKADDR:
+            ok = c->format == LEX_F_ETHERNET;
+            slla_present = true;
+            break;
+
+        case ND_OPT_PREFIX_INFORMATION:
+            ok = c->format == LEX_F_IPV6 && c->masked;
+            prefix_set = true;
+            break;
+
+        case ND_OPT_MTU:
+            ok = c->format == LEX_F_DECIMAL;
+            break;
+        }
+
+        if (!ok) {
+            lexer_error(ctx->lexer, "Invalid value for \"%s\" option",
+                        o->option->name);
+            return;
+        }
+    }
+
+    if (!slla_present) {
+        lexer_error(ctx->lexer, "slla option not present");
+        return;
+    }
+
+    if (!addr_mode_stateful && !prefix_set) {
+        lexer_error(ctx->lexer, "prefix option needs "
+                    "to be set when address mode is slaac/dhcpv6_stateless.");
+        return;
+    }
+
+    add_prerequisite(ctx, "ip6");
+}
+
+static void
+format_PUT_ND_RA_OPTS(const struct ovnact_put_opts *po,
+                      struct ds *s)
+{
+    format_put_opts("put_nd_ra_opts", po, s);
+}
+
+static void
+encode_put_nd_ra_option(const struct ovnact_gen_option *o,
+                        struct ofpbuf *ofpacts, ptrdiff_t ra_offset)
+{
+    const union expr_constant *c = o->value.values;
+
+    switch (o->option->code) {
+    case ND_RA_FLAG_ADDR_MODE:
+    {
+        struct ovs_ra_msg *ra = ofpbuf_at(ofpacts, ra_offset, sizeof *ra);
+        if (!strcmp(c->string, "dhcpv6_stateful")) {
+            ra->mo_flags = IPV6_ND_RA_FLAG_MANAGED_ADDR_CONFIG;
+        } else if (!strcmp(c->string, "dhcpv6_stateless")) {
+            ra->mo_flags = IPV6_ND_RA_FLAG_OTHER_ADDR_CONFIG;
+        }
+        break;
+    }
+
+    case ND_OPT_SOURCE_LINKADDR:
+    {
+        struct ovs_nd_lla_opt *lla_opt =
+            ofpbuf_put_uninit(ofpacts, sizeof *lla_opt);
+        lla_opt->type = ND_OPT_SOURCE_LINKADDR;
+        lla_opt->len = 1;
+        lla_opt->mac = c->value.mac;
+        break;
+    }
+
+    case ND_OPT_MTU:
+    {
+        struct ovs_nd_mtu_opt *mtu_opt =
+            ofpbuf_put_uninit(ofpacts, sizeof *mtu_opt);
+        mtu_opt->type = ND_OPT_MTU;
+        mtu_opt->len = 1;
+        mtu_opt->reserved = 0;
+        put_16aligned_be32(&mtu_opt->mtu, c->value.be32_int);
+        break;
+    }
+
+    case ND_OPT_PREFIX_INFORMATION:
+    {
+        struct ovs_nd_prefix_opt *prefix_opt =
+            ofpbuf_put_uninit(ofpacts, sizeof *prefix_opt);
+        uint8_t prefix_len = ipv6_count_cidr_bits(&c->mask.ipv6);
+        struct ovs_ra_msg *ra = ofpbuf_at(ofpacts, ra_offset, sizeof *ra);
+        prefix_opt->type = ND_OPT_PREFIX_INFORMATION;
+        prefix_opt->len = 4;
+        prefix_opt->prefix_len = prefix_len;
+        prefix_opt->la_flags = IPV6_ND_RA_OPT_PREFIX_ON_LINK;
+        if (!(ra->mo_flags & IPV6_ND_RA_FLAG_MANAGED_ADDR_CONFIG)) {
+            prefix_opt->la_flags |= IPV6_ND_RA_OPT_PREFIX_AUTONOMOUS;
+        }
+        put_16aligned_be32(&prefix_opt->valid_lifetime,
+                           htonl(IPV6_ND_RA_OPT_PREFIX_VALID_LIFETIME));
+        put_16aligned_be32(&prefix_opt->preferred_lifetime,
+                           htonl(IPV6_ND_RA_OPT_PREFIX_PREFERRED_LIFETIME));
+        put_16aligned_be32(&prefix_opt->reserved, 0);
+        memcpy(prefix_opt->prefix.be32, &c->value.be128[7].be32,
+               sizeof(ovs_be32[4]));
+        break;
+    }
+    }
+}
+
+static void
+encode_PUT_ND_RA_OPTS(const struct ovnact_put_opts *po,
+                      const struct ovnact_encode_params *ep OVS_UNUSED,
+                      struct ofpbuf *ofpacts)
+{
+    struct mf_subfield dst = expr_resolve_field(&po->dst);
+
+    size_t oc_offset = encode_start_controller_op(
+        ACTION_OPCODE_PUT_ND_RA_OPTS, true, NX_CTLR_NO_METER, ofpacts);
+    nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
+    ovs_be32 ofs = htonl(dst.ofs);
+    ofpbuf_put(ofpacts, &ofs, sizeof ofs);
+
+    /* Frame the complete ICMPv6 Router Advertisement data encoding
+     * the ND RA options in it, in the userdata field, so that when
+     * pinctrl module receives the ICMPv6 Router Solicitation packet
+     * it can copy the userdata field AS IS and resume the packet.
+     */
+    size_t ra_offset = ofpacts->size;
+    struct ovs_ra_msg *ra = ofpbuf_put_zeros(ofpacts, sizeof *ra);
+    ra->icmph.icmp6_type = ND_ROUTER_ADVERT;
+    ra->cur_hop_limit = IPV6_ND_RA_CUR_HOP_LIMIT;
+    ra->mo_flags = 0;
+    ra->router_lifetime = htons(IPV6_ND_RA_LIFETIME);
+
+    for (const struct ovnact_gen_option *o = po->options;
+         o < &po->options[po->n_options]; o++) {
+        encode_put_nd_ra_option(o, ofpacts, ra_offset);
+    }
+
+    encode_finish_controller_op(oc_offset, ofpacts);
+}
+
 
 static void
 parse_log_arg(struct action_context *ctx, struct ovnact_log *log)
@@ -1774,7 +2296,8 @@ parse_log_arg(struct action_context *ctx, struct ovnact_log *log)
         } else if (lexer_match_id(ctx->lexer, "allow")) {
             log->verdict = LOG_VERDICT_ALLOW;
         } else {
-            lexer_syntax_error(ctx->lexer, "unknown acl verdict");
+            lexer_syntax_error(ctx->lexer, "unknown verdict");
+            return;
         }
     } else if (lexer_match_id(ctx->lexer, "name")) {
         if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
@@ -1806,9 +2329,25 @@ parse_log_arg(struct action_context *ctx, struct ovnact_log *log)
                 log->severity = severity;
                 lexer_get(ctx->lexer);
                 return;
+            } else {
+                lexer_syntax_error(ctx->lexer, "unknown severity");
+                return;
             }
         }
         lexer_syntax_error(ctx->lexer, "expecting severity");
+    } else if (lexer_match_id(ctx->lexer, "meter")) {
+        if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
+            return;
+        }
+        /* If multiple meters are given, use the most recent. */
+        if (ctx->lexer->token.type == LEX_T_STRING) {
+            free(log->meter);
+            log->meter = xstrdup(ctx->lexer->token.s);
+        } else {
+            lexer_syntax_error(ctx->lexer, "expecting string");
+            return;
+        }
+        lexer_get(ctx->lexer);
     } else {
         lexer_syntax_error(ctx->lexer, NULL);
     }
@@ -1832,6 +2371,9 @@ parse_LOG(struct action_context *ctx)
             lexer_match(ctx->lexer, LEX_T_COMMA);
         }
     }
+    if (log->verdict == LOG_VERDICT_UNKNOWN) {
+        lexer_syntax_error(ctx->lexer, "expecting verdict");
+    }
 }
 
 static void
@@ -1844,16 +2386,32 @@ format_LOG(const struct ovnact_log *log, struct ds *s)
     }
 
     ds_put_format(s, "verdict=%s, ", log_verdict_to_string(log->verdict));
-    ds_put_format(s, "severity=%s);", log_severity_to_string(log->severity));
+    ds_put_format(s, "severity=%s", log_severity_to_string(log->severity));
+
+    if (log->meter) {
+        ds_put_format(s, ", meter=\"%s\"", log->meter);
+    }
+
+    ds_put_cstr(s, ");");
 }
 
 static void
 encode_LOG(const struct ovnact_log *log,
-           const struct ovnact_encode_params *ep OVS_UNUSED,
-           struct ofpbuf *ofpacts)
+           const struct ovnact_encode_params *ep, struct ofpbuf *ofpacts)
 {
+    uint32_t meter_id = NX_CTLR_NO_METER;
+
+    if (log->meter) {
+        meter_id = ovn_extend_table_assign_id(ep->meter_table, log->meter,
+                                              ep->lflow_uuid);
+        if (meter_id == EXT_TABLE_ID_INVALID) {
+            VLOG_WARN("Unable to assign id for log meter: %s", log->meter);
+            return;
+        }
+    }
+
     size_t oc_offset = encode_start_controller_op(ACTION_OPCODE_LOG, false,
-                                                  ofpacts);
+                                                  meter_id, ofpacts);
 
     struct log_pin_header *lph = ofpbuf_put_uninit(ofpacts, sizeof *lph);
     lph->verdict = log->verdict;
@@ -1871,6 +2429,174 @@ static void
 ovnact_log_free(struct ovnact_log *log)
 {
     free(log->name);
+    free(log->meter);
+}
+
+static void
+parse_set_meter_action(struct action_context *ctx)
+{
+    uint64_t rate = 0;
+    uint64_t burst = 0;
+
+    lexer_force_match(ctx->lexer, LEX_T_LPAREN); /* Skip '('. */
+    if (ctx->lexer->token.type == LEX_T_INTEGER
+        && ctx->lexer->token.format == LEX_F_DECIMAL) {
+        rate = ntohll(ctx->lexer->token.value.integer);
+    }
+    lexer_get(ctx->lexer);
+    if (lexer_match(ctx->lexer, LEX_T_COMMA)) {  /* Skip ','. */
+        if (ctx->lexer->token.type == LEX_T_INTEGER
+            && ctx->lexer->token.format == LEX_F_DECIMAL) {
+            burst = ntohll(ctx->lexer->token.value.integer);
+        }
+        lexer_get(ctx->lexer);
+    }
+    lexer_force_match(ctx->lexer, LEX_T_RPAREN); /* Skip ')'. */
+
+    if (!rate) {
+        lexer_error(ctx->lexer,
+                    "Rate %"PRId64" for set_meter is not in valid.",
+                    rate);
+        return;
+    }
+
+    struct ovnact_set_meter *cl = ovnact_put_SET_METER(ctx->ovnacts);
+    cl->rate = rate;
+    cl->burst = burst;
+}
+
+static void
+format_SET_METER(const struct ovnact_set_meter *cl, struct ds *s)
+{
+    if (cl->burst) {
+        ds_put_format(s, "set_meter(%"PRId64", %"PRId64");",
+                      cl->rate, cl->burst);
+    } else {
+        ds_put_format(s, "set_meter(%"PRId64");", cl->rate);
+    }
+}
+
+static void
+encode_SET_METER(const struct ovnact_set_meter *cl,
+                 const struct ovnact_encode_params *ep,
+                 struct ofpbuf *ofpacts)
+{
+    uint32_t table_id;
+    struct ofpact_meter *om;
+
+    /* Use the special "__string:" prefix to indicate that the name
+     * describes the meter itself. */
+    char *name;
+    if (cl->burst) {
+        name = xasprintf("__string: kbps burst stats bands=type=drop "
+                         "rate=%"PRId64" burst_size=%"PRId64"", cl->rate,
+                         cl->burst);
+    } else {
+        name = xasprintf("__string: kbps stats bands=type=drop "
+                         "rate=%"PRId64"", cl->rate);
+    }
+
+    table_id = ovn_extend_table_assign_id(ep->meter_table, name,
+                                          ep->lflow_uuid);
+    free(name);
+    if (table_id == EXT_TABLE_ID_INVALID) {
+        return;
+    }
+
+    /* Create an action to set the meter. */
+    om = ofpact_put_METER(ofpacts);
+    om->meter_id = table_id;
+}
+
+static void
+ovnact_set_meter_free(struct ovnact_set_meter *ct OVS_UNUSED)
+{
+}
+
+static void
+format_OVNFIELD_LOAD(const struct ovnact_load *load , struct ds *s)
+{
+    const struct ovn_field *f = ovn_field_from_name(load->dst.symbol->name);
+    switch (f->id) {
+    case OVN_ICMP4_FRAG_MTU:
+        ds_put_format(s, "%s = %u;", f->name,
+                      ntohs(load->imm.value.be16_int));
+        break;
+
+    case OVN_FIELD_N_IDS:
+    default:
+        OVS_NOT_REACHED();
+    }
+}
+
+static void
+encode_OVNFIELD_LOAD(const struct ovnact_load *load,
+            const struct ovnact_encode_params *ep OVS_UNUSED,
+            struct ofpbuf *ofpacts)
+{
+    const struct ovn_field *f = ovn_field_from_name(load->dst.symbol->name);
+    switch (f->id) {
+    case OVN_ICMP4_FRAG_MTU: {
+        size_t oc_offset = encode_start_controller_op(
+            ACTION_OPCODE_PUT_ICMP4_FRAG_MTU, true, NX_CTLR_NO_METER,
+            ofpacts);
+        ofpbuf_put(ofpacts, &load->imm.value.be16_int, sizeof(ovs_be16));
+        encode_finish_controller_op(oc_offset, ofpacts);
+        break;
+    }
+    case OVN_FIELD_N_IDS:
+    default:
+        OVS_NOT_REACHED();
+    }
+}
+
+static void
+parse_check_pkt_larger(struct action_context *ctx,
+                       const struct expr_field *dst,
+                       struct ovnact_check_pkt_larger *cipl)
+{
+     /* Validate that the destination is a 1-bit, modifiable field. */
+    char *error = expr_type_check(dst, 1, true);
+    if (error) {
+        lexer_error(ctx->lexer, "%s", error);
+        free(error);
+        return;
+    }
+
+    int pkt_len;
+    lexer_get(ctx->lexer); /* Skip check_pkt_len. */
+    if (!lexer_force_match(ctx->lexer, LEX_T_LPAREN)
+        || !lexer_get_int(ctx->lexer, &pkt_len)
+        || !lexer_force_match(ctx->lexer, LEX_T_RPAREN)) {
+        return;
+    }
+
+    cipl->dst = *dst;
+    cipl->pkt_len = pkt_len;
+}
+
+static void
+format_CHECK_PKT_LARGER(const struct ovnact_check_pkt_larger *cipl,
+                        struct ds *s)
+{
+    expr_field_format(&cipl->dst, s);
+    ds_put_format(s, " = check_pkt_larger(%d);", cipl->pkt_len);
+}
+
+static void
+encode_CHECK_PKT_LARGER(const struct ovnact_check_pkt_larger *cipl,
+                        const struct ovnact_encode_params *ep OVS_UNUSED,
+                        struct ofpbuf *ofpacts)
+{
+    struct ofpact_check_pkt_larger *check_pkt_larger =
+        ofpact_put_CHECK_PKT_LARGER(ofpacts);
+    check_pkt_larger->pkt_len = cipl->pkt_len;
+    check_pkt_larger->dst = expr_resolve_field(&cipl->dst);
+}
+
+static void
+ovnact_check_pkt_larger_free(struct ovnact_check_pkt_larger *cipl OVS_UNUSED)
+{
 }
 
 /* Parses an assignment or exchange or put_dhcp_opts action. */
@@ -1898,6 +2624,14 @@ parse_set_action(struct action_context *ctx)
         } else if (!strcmp(ctx->lexer->token.s, "dns_lookup")
                    && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
             parse_dns_lookup(ctx, &lhs, ovnact_put_DNS_LOOKUP(ctx->ovnacts));
+        } else if (!strcmp(ctx->lexer->token.s, "put_nd_ra_opts")
+                && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
+            parse_put_nd_ra_opts(ctx, &lhs,
+                                 ovnact_put_PUT_ND_RA_OPTS(ctx->ovnacts));
+        } else if (!strcmp(ctx->lexer->token.s, "check_pkt_larger")
+                && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
+            parse_check_pkt_larger(ctx, &lhs,
+                                   ovnact_put_CHECK_PKT_LARGER(ctx->ovnacts));
         } else {
             parse_assignment_action(ctx, false, &lhs);
         }
@@ -1940,8 +2674,22 @@ parse_action(struct action_context *ctx)
         parse_CLONE(ctx);
     } else if (lexer_match_id(ctx->lexer, "arp")) {
         parse_ARP(ctx);
+    } else if (lexer_match_id(ctx->lexer, "icmp4")) {
+        parse_ICMP4(ctx);
+    } else if (lexer_match_id(ctx->lexer, "icmp4_error")) {
+        parse_ICMP4_ERROR(ctx);
+    } else if (lexer_match_id(ctx->lexer, "icmp6")) {
+        parse_ICMP6(ctx);
+    } else if (lexer_match_id(ctx->lexer, "igmp")) {
+        ovnact_put_IGMP(ctx->ovnacts);
+    } else if (lexer_match_id(ctx->lexer, "tcp_reset")) {
+        parse_TCP_RESET(ctx);
     } else if (lexer_match_id(ctx->lexer, "nd_na")) {
         parse_ND_NA(ctx);
+    } else if (lexer_match_id(ctx->lexer, "nd_na_router")) {
+        parse_ND_NA_ROUTER(ctx);
+    } else if (lexer_match_id(ctx->lexer, "nd_ns")) {
+        parse_ND_NS(ctx);
     } else if (lexer_match_id(ctx->lexer, "get_arp")) {
         parse_get_mac_bind(ctx, 32, ovnact_put_GET_ARP(ctx->ovnacts));
     } else if (lexer_match_id(ctx->lexer, "put_arp")) {
@@ -1954,6 +2702,10 @@ parse_action(struct action_context *ctx)
         parse_SET_QUEUE(ctx);
     } else if (lexer_match_id(ctx->lexer, "log")) {
         parse_LOG(ctx);
+    } else if (lexer_match_id(ctx->lexer, "set_meter")) {
+        parse_set_meter_action(ctx);
+    } else if (lexer_match_id(ctx->lexer, "trigger_event")) {
+        parse_trigger_event(ctx, ovnact_put_TRIGGER_EVENT(ctx->ovnacts));
     } else {
         lexer_syntax_error(ctx->lexer, "expecting action");
     }

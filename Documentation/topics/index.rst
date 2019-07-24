@@ -38,10 +38,12 @@ OVS
 
    design
    datapath
+   fuzzing/index
    integration
    porting
    openflow
    bonding
+   networking-namespaces
    ovsdb-replication
    dpdk/index
    windows
@@ -57,6 +59,8 @@ OVN
    :maxdepth: 2
 
    high-availability
+   role-based-access-control
+   ovn-news-2.8
 
 .. list-table::
 

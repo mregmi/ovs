@@ -34,7 +34,7 @@ The responsibilities of an Open vSwitch committer are documented
 The process for adding or removing committers is documented
 `here <Documentation/internals/committer-grant-revocation.rst>`__.
 
-This is the current list of Open vSwitch committers:
+This is the current list of active Open vSwitch committers:
 
 .. list-table:: OVS Maintainers
    :header-rows: 1
@@ -53,10 +53,12 @@ This is the current list of Open vSwitch committers:
      - blp@ovn.org
    * - Daniele Di Proietto
      - daniele.di.proietto@gmail.com
-   * - Ethan J. Jackson
-     - ejj@eecs.berkeley.edu
    * - Gurucharan Shetty
      - guru@ovn.org
+   * - Ian Stokes
+     - istokes@ovn.org
+   * - Ilya Maximets
+     - i.maximets@samsung.com
    * - Jarno Rajahalme
      - jarno@ovn.org
    * - Jesse Gross
@@ -66,7 +68,7 @@ This is the current list of Open vSwitch committers:
    * - Justin Pettit
      - jpettit@ovn.org
    * - Pravin B Shelar
-     - pshelar@nicira.com
+     - pshelar@ovn.org
    * - Russell Bryant
      - russell@ovn.org
    * - Simon Horman
@@ -75,3 +77,15 @@ This is the current list of Open vSwitch committers:
      - tgraf@noironetworks.com
    * - YAMAMOTO Takashi
      - yamamoto@midokura.com
+
+The project also maintains a list of Emeritus Committers (or Maintainers).
+More information about Emeritus Committers can be found
+`here <Documentation/internals/committer-emeritus-status.rst>`__.
+
+.. list-table:: OVS Emeritus Maintainers
+   :header-rows: 1
+
+   * - Name
+     - Email
+   * - Ethan J. Jackson
+     - ejj@eecs.berkeley.edu

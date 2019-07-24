@@ -39,6 +39,7 @@
 #include "svec.h"
 #include "syslog-direct.h"
 #include "syslog-libc.h"
+#include "syslog-null.h"
 #include "syslog-provider.h"
 #include "timeval.h"
 #include "unixctl.h"
@@ -584,7 +585,9 @@ vlog_set_syslog_method(const char *method)
         return;
     }
 
-    if (!strcmp(method, "libc")) {
+    if (!strcmp(method, "null")) {
+        syslogger = syslog_null_create();
+    } else if (!strcmp(method, "libc")) {
         syslogger = syslog_libc_create();
     } else if (!strncmp(method, "udp:", 4) || !strncmp(method, "unix:", 5)) {
         syslogger = syslog_direct_create(method);
@@ -599,7 +602,7 @@ vlog_set_syslog_target(const char *target)
 {
     int new_fd;
 
-    inet_open_active(SOCK_DGRAM, target, 0, NULL, &new_fd, 0);
+    inet_open_active(SOCK_DGRAM, target, -1, NULL, &new_fd, 0);
 
     ovs_rwlock_wrlock(&pattern_rwlock);
     if (syslog_fd >= 0) {
@@ -778,7 +781,12 @@ vlog_init(void)
          * log anything before calling ovsthread_once_done() will deadlock. */
         atomic_read_explicit(&log_facility, &facility, memory_order_relaxed);
         if (!syslogger) {
-            syslogger = syslog_libc_create();
+            char *env = getenv("OVS_SYSLOG_METHOD");
+            if (env && env[0]) {
+                vlog_set_syslog_method(env);
+            } else {
+                syslogger = syslog_libc_create();
+            }
         }
         syslogger->class->openlog(syslogger, facility ? facility : LOG_DAEMON);
         ovsthread_once_done(&once);
@@ -833,6 +841,16 @@ vlog_enable_async(void)
     if (log_fd >= 0 && !log_writer) {
         log_writer = async_append_create(log_fd);
     }
+    ovs_mutex_unlock(&log_file_mutex);
+}
+
+void
+vlog_disable_async(void)
+{
+    ovs_mutex_lock(&log_file_mutex);
+    log_async = false;
+    async_append_destroy(log_writer);
+    log_writer = NULL;
     ovs_mutex_unlock(&log_file_mutex);
 }
 
@@ -942,7 +960,7 @@ format_log_message(const struct vlog_module *module, enum vlog_level level,
     for (p = pattern; *p != '\0'; ) {
         const char *subprogram_name;
         enum { LEFT, RIGHT } justify = RIGHT;
-        int pad = '0';
+        int pad = ' ';
         size_t length, field, used;
 
         if (*p != '%') {

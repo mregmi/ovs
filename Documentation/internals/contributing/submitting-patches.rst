@@ -95,7 +95,7 @@ Where:
 
 ``<summary>``:
 
-  briefly describes the change.  Use the the imperative form,
+  briefly describes the change.  Use the imperative form,
   e.g. "Force SNAT for multiple gateway routers." or "Fix daemon exit
   for bad datapaths or flows."  Try to keep the summary short, about
   50 characters wide.
@@ -145,6 +145,9 @@ The description ends with a series of tags, written one to a line as the last
 paragraph of the email.  Each tag indicates some property of the patch in an
 easily machine-parseable manner.
 
+Please don't wrap a tag across multiple lines.  If necessary, it's OK to have a
+tag extend beyond the customary maximum width of a commit message.
+
 Examples of common tags follow.
 
 ``Signed-off-by: Author Name <author.name@email.address...>``
@@ -156,6 +159,12 @@ Examples of common tags follow.
 
   If the author and submitter are different, each must sign off.  If the patch
   has more than one author, all must sign off.
+
+  Signed-off-by tags should be the last tags in the commit message.  If the
+  author (or authors) and submitter are different, the author tags should come
+  first.  More generally, occasionally a patch might pass through a chain of
+  submitters, and in such a case the sign-offs should be arranged in
+  chronological order.
 
   ::
 
@@ -252,7 +261,7 @@ Examples of common tags follow.
 
   ::
 
-      Reported-at: http://openvswitch.org/pipermail/dev/2014-June/040952.html
+      Reported-at: https://mail.openvswitch.org/pipermail/ovs-dev/2014-June/284495.html
 
 ``Submitted-at: <URL>``
 
@@ -318,7 +327,7 @@ Developer's Certificate of Origin
 
 To help track the author of a patch as well as the submission chain, and be
 clear that the developer has authority to submit a patch for inclusion in
-openvswitch please sign off your work.  The sign off certifies the following:
+Open vSwitch please sign off your work.  The sign off certifies the following:
 
 ::
 
@@ -411,9 +420,9 @@ file describes the coding style used in most of Open vSwitch. Use Linux kernel
 coding style for Linux kernel code.
 
 If your code is non-datapath code, you may use the ``utilities/checkpatch.py``
-utility as a quick check for certain commonly occuring mistakes (improper
+utility as a quick check for certain commonly occurring mistakes (improper
 leading/trailing whitespace, missing signoffs, some improper formatted patch
-files).  For linux datapath code, it is a good idea to use the linux script
+files).  For Linux datapath code, it is a good idea to use the Linux script
 ``checkpatch.pl``.
 
 Example

@@ -27,7 +27,7 @@
 #include "dirs.h"
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "stream.h"
 #include "stream-ssl.h"
 #include "unixctl.h"
@@ -253,8 +253,8 @@ Options:\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
   -V, --version             display version information\n\
-", program_name, program_name, default_db(), default_db());
-    stream_usage("database", true, false, false);
+", program_name, program_name, default_db(), default_sb_db());
+    stream_usage("database", true, false, true);
     daemon_usage();
     vlog_usage();
     exit(EXIT_SUCCESS);

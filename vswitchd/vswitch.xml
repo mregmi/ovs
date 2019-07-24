@@ -122,6 +122,16 @@
           start receiving packets from the datapath and re-setup the flows.
         </p>
         <p>
+          Additionally, <code>ovs-vswitchd</code> is prevented from connecting
+          to controllers when this value is set to <code>true</code>. This
+          prevents controllers from making changes to the flow table in the
+          middle of flow restoration, which could result in undesirable
+          intermediate states. Once this value has been set to
+          <code>false</code> and the desired flow state has been
+          restored, <code>ovs-vswitchd</code> will be able to reconnect to
+          controllers and process any new flow table modifications.
+        </p>
+        <p>
           Thus, with this option, the procedure for a hot-upgrade of
           <code>ovs-vswitchd</code> becomes roughly the following:
         </p>
@@ -198,19 +208,31 @@
           available, Open vSwitch may not be able to offload
           functionality to hardware.
         </p>
+        <p>
+          In order to dump HW offloaded flows use
+          <code>ovs-appctl dpctl/dump-flows</code>, <code>ovs-dpctl</code>
+          doesn't support this functionality. See ovs-vswitchd(8) for details.
+        </p>
       </column>
 
       <column name="other_config" key="tc-policy"
-              type='{"type": "string"}'>
+              type='{"type": "string",
+                     "enum": ["set", ["none", "skip_sw", "skip_hw"]]}'>
         <p>
-            Specified the policy used with HW offloading.
-            Options:
-                <code>none</code>    - Add software rule and offload rule to HW.
-                <code>skip_sw</code> - Offload rule to HW only.
-                <code>skip_hw</code> - Add software rule without offloading rule to HW.
+          Specified the policy used with HW offloading.
+          Options:
+          <dl>
+            <dt><code>none</code></dt>
+            <dd>Add software rule and offload rule to HW.</dd>
+            <dt><code>skip_sw</code></dt>
+            <dd>Offload rule to HW only.</dd>
+            <dt><code>skip_hw</code></dt>
+            <dd>Add software rule without offloading rule to HW.</dd>
+          </dl>
         </p>
         <p>
-            This is only relevant if HW offloading is enabled (hw-offload).
+          This is only relevant if
+          <ref column="other_config" key="hw-offload"/> is enabled.
         </p>
         <p>
           The default value is <code>none</code>.
@@ -218,11 +240,18 @@
       </column>
 
       <column name="other_config" key="dpdk-init"
-              type='{"type": "boolean"}'>
+              type='{"type": "string",
+                     "enum": ["set", ["false", "true", "try"]]}'>
         <p>
-          Set this value to <code>true</code> to enable runtime support for
-          DPDK ports. The vswitch must have compile-time support for DPDK as
-          well.
+          Set this value to <code>true</code> or <code>try</code> to enable
+          runtime support for DPDK ports. The vswitch must have compile-time
+          support for DPDK as well.
+        </p>
+        <p>
+          A value of <code>true</code> will cause the ovs-vswitchd process to
+          abort if DPDK cannot be initialized. A value of <code>try</code>
+          will allow the ovs-vswitchd process to continue running even if DPDK
+          cannot be initialized.
         </p>
         <p>
           The default value is <code>false</code>. Changing this value requires
@@ -302,9 +331,32 @@
         </p>
         <p>
           If dpdk-socket-mem and dpdk-alloc-mem are not specified, dpdk-socket-mem
-          will be used and the default value is 1024,0. If dpdk-socket-mem and
-          dpdk-alloc-mem are specified at same time, dpdk-socket-mem will be
-          used as default. Changing this value requires restarting the daemon.
+          will be used and the default value is 1024 for each numa node. If
+          dpdk-socket-mem and dpdk-alloc-mem are specified at same time,
+          dpdk-socket-mem will be used as default. Changing this value
+          requires restarting the daemon.
+        </p>
+      </column>
+
+      <column name="other_config" key="dpdk-socket-limit"
+              type='{"type": "string"}'>
+        <p>
+          Limits the maximum amount of memory that can be used from the
+          hugepage pool, on a per-socket basis.
+        </p>
+        <p>
+          The specifier is a comma-separated list of memory limits per socket.
+          <code>0</code> will disable the limit for a particular socket.
+        </p>
+        <p>
+          If not specified, OVS will configure limits equal to the amount of
+          preallocated memory specified by <ref column="other_config"
+          key="dpdk-socket-mem"/> or <code>--socket-mem</code> in
+          <ref column="other_config" key="dpdk-extra"/>. If none of the above
+          options specified or <code>--legacy-mem</code> provided in
+          <ref column="other_config" key="dpdk-extra"/>, limits will not be
+          applied.
+          Changing this value requires restarting the daemon.
         </p>
       </column>
 
@@ -341,6 +393,119 @@
         </p>
         <p>
           Changing this value requires restarting the daemon.
+        </p>
+      </column>
+
+      <column name="other_config" key="vhost-iommu-support"
+              type='{"type": "boolean"}'>
+        <p>
+          vHost IOMMU is a security feature, which restricts the vhost memory
+          that a virtio device may access. vHost IOMMU support is disabled by
+          default, due to a bug in QEMU implementations of the vhost REPLY_ACK
+          protocol, (on which vHost IOMMU relies) prior to v2.9.1. Setting this
+          value to <code>true</code> enables vHost IOMMU support for vHost User
+          Client ports in OvS-DPDK, starting from DPDK v17.11.
+        </p>
+        <p>
+          Changing this value requires restarting the daemon.
+        </p>
+      </column>
+
+      <column name="other_config" key="vhost-postcopy-support"
+              type='{"type": "boolean"}'>
+        <p>
+          vHost post-copy is a feature which allows switching live migration
+          of VM attached to dpdkvhostuserclient port to post-copy mode if
+          default pre-copy migration can not be converged or takes too long to
+          converge.
+          Setting this value to <code>true</code> enables vHost post-copy
+          support for all dpdkvhostuserclient ports. Available starting from
+          DPDK v18.11 and QEMU 2.12.
+        </p>
+        <p>
+          Changing this value requires restarting the daemon.
+        </p>
+      </column>
+
+      <column name="other_config" key="per-port-memory"
+              type='{"type": "boolean"}'>
+        <p>
+          By default OVS DPDK uses a shared memory model wherein devices
+          that have the same MTU and socket values can share the same
+          mempool. Setting this value to <code>true</code> changes this
+          behaviour. Per port memory allow DPDK devices to use private
+          memory per device. This can provide greater transparency as
+          regards memory usage but potentially at the cost of greater memory
+          requirements.
+        </p>
+        <p>
+          Changing this value requires restarting the daemon if dpdk-init has
+          already been set to true.
+        </p>
+      </column>
+
+      <column name="other_config" key="tx-flush-interval"
+              type='{"type": "integer",
+                     "minInteger": 0, "maxInteger": 1000000}'>
+        <p>
+          Specifies the time in microseconds that a packet can wait in output
+          batch for sending i.e. amount of time that packet can spend in an
+          intermediate output queue before sending to netdev.
+          This option can be used to configure balance between throughput
+          and latency. Lower values decreases latency while higher values
+          may be useful to achieve higher performance.
+        </p>
+        <p>
+          Defaults to 0 i.e. instant packet sending (latency optimized).
+        </p>
+      </column>
+
+      <column name="other_config" key="pmd-perf-metrics"
+              type='{"type": "boolean"}'>
+        <p>
+          Enables recording of detailed PMD performance metrics for analysis
+          and trouble-shooting. This can have a performance impact in the
+          order of 1%.
+        </p>
+        <p>
+          Defaults to false but can be changed at any time.
+        </p>
+      </column>
+
+      <column name="other_config" key="smc-enable"
+              type='{"type": "boolean"}'>
+        <p>
+          Signature match cache or SMC is a cache between EMC and megaflow
+          cache. It does not store the full key of the flow, so it is more
+          memory efficient comparing to EMC cache. SMC is especially useful
+          when flow count is larger than EMC capacity.
+        </p>
+        <p>
+          Defaults to false but can be changed at any time.
+        </p>
+      </column>
+
+      <column name="other_config" key="pmd-rxq-assign"
+              type='{"type": "string",
+                     "enum": ["set", ["cycles", "roundrobin"]]}'>
+        <p>
+          Specifies how RX queues will be automatically assigned to CPU cores.
+          Options:
+          <dl>
+            <dt><code>cycles</code></dt>
+            <dd>Rxqs will be sorted by order of measured processing cycles
+            before being assigned to CPU cores.</dd>
+            <dt><code>roundrobin</code></dt>
+            <dd>Rxqs will be round-robined across CPU cores.</dd>
+          </dl>
+        </p>
+        <p>
+          The default value is <code>cycles</code>.
+        </p>
+        <p>
+          Changing this value will affect an automatic re-assignment of Rxqs to
+          CPUs. Note: Rxqs mapped to CPU cores with
+          <code>pmd-rxq-affinity</code> are unaffected.
         </p>
       </column>
 
@@ -405,11 +570,11 @@
           e.g. a packet with more 802.1q headers will match Ethernet type
           0x8100.
         </p>
+
         <p>
-          Value <code>0</code> means unlimited.  The actual number of supported
-          VLAN headers is the smallest of <code>vlan-limit</code>, the number
-          of VLANs supported by Open vSwitch userspace (currently 2), and the
-          number supported by the datapath.
+          Open vSwitch userspace currently supports at most 2 VLANs, and each
+          datapath has its own limit.  If <code>vlan-limit</code> is nonzero,
+          it acts as a further limit.
         </p>
 
         <p>
@@ -419,8 +584,81 @@
           VLAN.
         </p>
       </column>
-    </group>
+      <column name="other_config" key="bundle-idle-timeout"
+              type='{"type": "integer", "minInteger": 1}'>
+        <p>
+          The maximum time (in seconds) that idle bundles will wait
+          to be expired since it was either opened, modified or closed.
+        </p>
+        <p>
+          OpenFlow specification mandates the timeout to be at least one
+          second. The default is 10 seconds.
+        </p>
+      </column>
 
+      <column name="other_config" key="offload-rebalance"
+              type='{"type": "boolean"}'>
+        <p>
+            Configures HW offload rebalancing, that allows to dynamically
+            offload and un-offload flows while an offload-device is out of
+            resources (OOR). This policy allows flows to be selected for
+            offloading based on the packets-per-second (pps) rate of flows.
+        </p>
+        <p>
+          Set this value to <code>true</code> to enable this option.
+        </p>
+        <p>
+          The default value is <code>false</code>. Changing this value requires
+          restarting the daemon.
+        </p>
+        <p>
+            This is only relevant if HW offloading is enabled (hw-offload).
+            When this policy is enabled, it also requires 'tc-policy' to
+            be set to 'skip_sw'.
+        </p>
+      </column>
+      <column name="other_config" key="pmd-auto-lb"
+              type='{"type": "boolean"}'>
+        <p>
+         Configures PMD Auto Load Balancing that allows automatic assignment of
+         RX queues to PMDs if any of PMDs is overloaded (i.e. processing cycles
+         > 95%).
+        </p>
+        <p>
+         It uses current scheme of cycle based assignment of RX queues that
+         are not statically pinned to PMDs.
+        </p>
+        <p>
+          The default value is <code>false</code>.
+        </p>
+        <p>
+          Set this value to <code>true</code> to enable this option. It is
+          currently disabled by default and an experimental feature.
+        </p>
+        <p>
+         This only comes in effect if cycle based assignment is enabled and
+         there are more than one non-isolated PMDs present and at least one of
+         it polls more than one queue.
+        </p>
+      </column>
+      <column name="other_config" key="pmd-auto-lb-rebal-interval"
+              type='{"type": "integer",
+                     "minInteger": 0, "maxInteger": 20000}'>
+        <p>
+         The minimum time (in minutes) 2 consecutive PMD Auto Load Balancing
+         iterations.
+        </p>
+        <p>
+         The defaul value is 1 min. If configured to 0 then it would be
+         converted to default value i.e. 1 min
+        </p>
+        <p>
+         This option can be configured to avoid frequent trigger of auto load
+         balancing of PMDs. For e.g. set the value (in min) such that it occurs
+         once in few hours or a day or a week.
+        </p>
+      </column>
+    </group>
     <group title="Status">
       <column name="next_cfg">
         Sequence number for client to increment.  When a client modifies
@@ -433,6 +671,11 @@
         Sequence number that Open vSwitch sets to the current value of
         <ref column="next_cfg"/> after it finishes applying a set of
         configuration changes.
+      </column>
+
+      <column name="dpdk_initialized">
+        True if <ref column="other_config" key="dpdk-init"/> is set to
+        true and the DPDK library is successfully initialized.
       </column>
 
       <group title="Statistics">
@@ -618,6 +861,12 @@
         </p>
       </column>
 
+      <column name="dpdk_version">
+        <p>
+          The version of the linked DPDK library.
+        </p>
+      </column>
+
     </group>
 
     <group title="Capabilities">
@@ -656,11 +905,133 @@
       </p>
 
       <column name="manager_options">
-        Database clients to which the Open vSwitch database server should
-        connect or to which it should listen, along with options for how these
-        connection should be configured.  See the <ref table="Manager"/> table
-        for more information.
+        <p>
+          Database clients to which the Open vSwitch database server should
+          connect or to which it should listen, along with options for how
+          these connections should be configured.  See the <ref
+          table="Manager"/> table for more information.
+        </p>
+
+        <p>
+          For this column to serve its purpose, <code>ovsdb-server</code> must
+          be configured to honor it.  The easiest way to do this is to invoke
+          <code>ovsdb-server</code> with the option
+          <option>--remote=db:Open_vSwitch,Open_vSwitch,manager_options</option>
+          The startup scripts that accompany Open vSwitch do this by default.
+        </p>
       </column>
+    </group>
+
+    <group title="IPsec">
+      <p>
+        These settings control the global configuration of IPsec tunnels.  The
+        <code>options</code> column of the <code>Interface</code> table
+        configures IPsec for individual tunnels.
+      </p>
+      <p>
+        OVS IPsec supports the following three forms of authentication.
+        Currently, all IPsec tunnels must use the same form:
+      </p>
+      <ol>
+        <li>
+          Pre-shared keys: Omit the global settings.  On each tunnel, set <ref
+          column="options" key="psk"/>.
+        </li>
+        <li>
+          Self-signed certificates: Set the <code>private_key</code> and
+          <code>certificate</code> global settings.  On each tunnel, set <ref
+          column="options" key="remote_cert"/>.  The remote certificate can be
+          self-signed.
+        </li>
+        <li>
+          CA-signed certificates: Set all of the global settings.  On each
+          tunnel, set <ref column="options" key="remote_name"/> to the common
+          name (CN) of the remote certificate. The remote certificate must be
+          signed by the CA.
+        </li>
+      </ol>
+      <column name="other_config" key="private_key"
+              type='{"type": "string"}'>
+          <p>
+            Name of a PEM file containing the private key used as the switch's
+            identity for IPsec tunnels.
+          </p>
+      </column>
+      <column name="other_config" key="certificate"
+              type='{"type": "string"}'>
+          <p>
+            Name of a PEM file containing a certificate that certifies the
+            switch's private key, and identifies a trustworthy switch for IPsec
+            tunnels. The certificate must be x.509 version 3 and with the
+            string in common name (CN) also set in the subject alternative name
+            (SAN).
+          </p>
+      </column>
+      <column name="other_config" key="ca_cert"
+              type='{"type": "string"}'>
+          <p>
+            Name of a PEM file containing the CA certificate used to verify
+            that a remote switch of the IPsec tunnel is trustworthy.
+          </p>
+      </column>
+
+      <group title="Plaintext Tunnel Policy">
+        <p>
+          When an IPsec tunnel is configured in this database, multiple
+          independent components take responsibility for implementing it.
+          <code>ovs-vswitchd</code> and its datapath handle packet forwarding
+          to the tunnel and a separate daemon pushes the tunnel's IPsec policy
+          configuration to the kernel or other entity that implements it.
+          There is a race: if the former configuration completes before the
+          latter, then packets sent by the local host over the tunnel can be
+          transmitted in plaintext.  Using this setting, OVS users can avoid
+          this undesirable situation.
+        </p>
+        <column name="other_config" key="ipsec_skb_mark"
+                type='{"type": "string"}'>
+          <p>
+            This setting takes the form
+            <code><var>value</var>/<var>mask</var></code>.  If it is specified,
+            then the <code>skb_mark</code> field in every outgoing tunneled
+            packet sent in plaintext is compared against it and, if it matches,
+            the packet is dropped.  This is a global setting that is applied to
+            every tunneled packet, regardless of whether IPsec encryption is
+            enabled for the tunnel, the type of tunnel, or whether OVS is
+            involved.
+          </p>
+
+          <p>
+            Example policies:
+          </p>
+
+          <dl>
+            <dt><code>1/1</code></dt>
+            <dd>
+              Drop all unencrypted tunneled packets in which the
+              least-significant bit of <code>skb_mark</code> is 1.  This would
+              be a useful policy given an OpenFlow flow table that sets
+              <code>skb_mark</code> to 1 for traffic that should be encrypted.
+              The default <code>skb_mark</code> is 0, so this would not affect
+              other traffic.
+            </dd>
+
+            <dt><code>0/1</code></dt>
+            <dd>
+              Drop all unencrypted tunneled packets in which the
+              least-significant bit of <code>skb_mark</code> is 0.  This would
+              be a useful policy if no unencrypted tunneled traffic should exit
+              the system without being specially whitelisted by setting
+              <code>skb_mark</code> to 1.
+            </dd>
+
+            <dt>(empty)</dt>
+            <dd>
+              If this setting is empty or unset, then all unencrypted tunneled
+              packets are transmitted in the usual way.
+            </dd>
+          </dl>
+        </column>
+      </group>
     </group>
 
     <group title="Common Columns">
@@ -751,12 +1122,12 @@
 
         <p>
           If there are primary controllers, removing all of them clears the
-          flow table.  If there are no primary controllers, adding one also
-          clears the flow table.  Other changes to the set of controllers, such
-          as adding or removing a service controller, adding another primary
-          controller to supplement an existing primary controller, or removing
-          only one of two primary controllers, have no effect on the flow
-          table.
+          OpenFlow flow tables, group table, and meter table.  If there are no
+          primary controllers, adding one also clears these tables.  Other
+          changes to the set of controllers, such as adding or removing a
+          service controller, adding another primary controller to supplement
+          an existing primary controller, or removing only one of two primary
+          controllers, have no effect on these tables.
         </p>
       </column>
 
@@ -801,12 +1172,16 @@
           avoid loops on such a bridge, configure <code>secure</code> mode or
           enable STP (see <ref column="stp_enable"/>).
         </p>
-        <p>When more than one controller is configured,
-        <ref column="fail_mode"/> is considered only when none of the
-        configured controllers can be contacted.</p>
+        <p>
+          The <ref column="fail_mode"/> setting applies only to primary
+          controllers.  When more than one primary controller is configured,
+          <ref column="fail_mode"/> is considered only when none of the
+          configured controllers can be contacted.
+        </p>
         <p>
           Changing <ref column="fail_mode"/> when no primary controllers are
-          configured clears the flow table.
+          configured clears the OpenFlow flow tables, group table, and meter
+          table.
         </p>
       </column>
 
@@ -867,12 +1242,13 @@
       </column>
 
       <column name="other_config" key="datapath-id">
-        Exactly 16 hex digits to set the OpenFlow datapath ID to a specific
-        value.  May not be all-zero.
+        Overrides the default OpenFlow datapath ID, setting it to the specified
+        value specified in hex.  The value must either have a <code>0x</code>
+        prefix or be exactly 16 hex digits long.  May not be all-zero.
       </column>
 
       <column name="other_config" key="dp-desc">
-        Human readable description of datapath.  It it a maximum 256
+        Human readable description of datapath.  It is a maximum 256
         byte-long free-form string to describe the datapath for
         debugging purposes, e.g. <code>switch3 in room 3120</code>.
       </column>
@@ -893,17 +1269,9 @@
       </column>
 
       <column name="protocols">
-        <p>
-          List of OpenFlow protocols that may be used when negotiating
-          a connection with a controller.  OpenFlow 1.0, 1.1, 1.2, 1.3, and
-          1.4 are enabled by default if this column is empty.
-        </p>
-
-        <p>
-          OpenFlow 1.5 and 1.6 are not enabled by default because their
-          implementations are missing features.  In addition, the OpenFlow 1.6
-          specification is still under development and thus subject to change.
-        </p>
+        List of OpenFlow protocols that may be used when negotiating a
+        connection with a controller.  OpenFlow 1.0, 1.1, 1.2, 1.3, 1.4, and
+        1.5 are enabled by default if this column is empty.
       </column>
     </group>
 
@@ -1286,7 +1654,7 @@
               type='{"type": "integer", "minInteger": 1}'>
         <p>
           The maximum number of MAC addresses to learn.  The default is
-          currently 2048.  The value, if specified, is forced into a reasonable
+          currently 8192.  The value, if specified, is forced into a reasonable
           range, currently 10 to 1,000,000.
         </p>
       </column>
@@ -1300,7 +1668,7 @@
       <column name="external_ids"/>
     </group>
   </table>
-  
+
   <table name="Port" table="Port or bond configuration.">
     <p>A port within a <ref table="Bridge"/>.</p>
     <p>Most commonly, a port has exactly one ``interface,'' pointed to by its
@@ -1506,7 +1874,8 @@
       </column>
 
       <column name="other_config" key="priority-tags"
-              type='{"type": "boolean"}'>
+              type='{"type": "string",
+                     "enum": ["set", ["never", "if-nonzero", "always"]]}'>
         <p>
           An 802.1Q header contains two important pieces of information: a VLAN
           ID and a priority.  A frame with a zero VLAN ID, called a
@@ -1519,12 +1888,14 @@
           header at all, even when the VLAN ID is zero.  Therefore, by default
           Open vSwitch does not output priority-tagged frames, instead omitting
           the 802.1Q header entirely if the VLAN ID is zero.  Set this key to
-          <code>true</code> to enable priority-tagged frames on a port.
+          <code>if-nonzero</code> to enable priority-tagged frames on a port.
         </p>
 
         <p>
-          Regardless of this setting, Open vSwitch omits the 802.1Q header on
-          output if both the VLAN ID and priority would be zero.
+          For <code>if-nonzero</code> Open vSwitch omits the 802.1Q header on
+          output if both the VLAN ID and priority would be zero. Set to
+          <code>always</code> to retain the 802.1Q header in such frames as
+          well.
         </p>
 
         <p>
@@ -2067,7 +2438,8 @@
           their hardware.</li>
         </ul>
         <p>Some interfaces may not have a software-controllable MAC
-        address.</p>
+        address.  This option only affects internal ports.  For other type ports,
+        you can change the MAC address outside Open vSwitch, using ip command.</p>
       </column>
 
       <column name="error">
@@ -2158,7 +2530,18 @@
           imprecisely for internal interfaces.</dd>
 
           <dt><code>tap</code></dt>
-          <dd>A TUN/TAP device managed by Open vSwitch.</dd>
+          <dd>
+            <p>
+              A TUN/TAP device managed by Open vSwitch.
+            </p>
+            <p>
+              Open vSwitch checks the interface state before send packets
+              to the device.  When it is <code>down</code>, the packets are
+              dropped and the tx_dropped statistic is updated accordingly.
+              Older versions of Open vSwitch did not check the interface state
+              and then the tx_packets was incremented along with tx_dropped.
+            </p>
+          </dd>
 
           <dt><code>geneve</code></dt>
           <dd>
@@ -2171,8 +2554,14 @@
 
           <dt><code>gre</code></dt>
           <dd>
-            Generic Routing Encapsulation (GRE) over IPv4/IPv6 tunnel,
+            Generic Routing Encapsulation (GRE) over IPv4 tunnel,
             configurable to encapsulate layer 2 or layer 3 traffic.
+          </dd>
+
+          <dt><code>ip6gre</code></dt>
+          <dd>
+            Generic Routing Encapsulation (GRE) over IPv6 tunnel,
+            encapsulate layer 2 traffic.
           </dd>
 
           <dt><code>vxlan</code></dt>
@@ -2226,10 +2615,6 @@
           <dd>
             A pair of virtual devices that act as a patch cable.
           </dd>
-
-          <dt><code>null</code></dt>
-          <dd>An ignored interface. Deprecated and slated for removal in
-          February 2013.</dd>
         </dl>
       </column>
     </group>
@@ -2237,8 +2622,8 @@
     <group title="Tunnel Options">
       <p>
         These options apply to interfaces with <ref column="type"/> of
-        <code>geneve</code>, <code>gre</code>, <code>vxlan</code>,
-        <code>lisp</code> and <code>stt</code>.
+        <code>geneve</code>, <code>gre</code>, <code>ip6gre</code>,
+        <code>vxlan</code>, <code>lisp</code> and <code>stt</code>.
       </p>
 
       <p>
@@ -2281,9 +2666,8 @@
 
       <column name="options" key="local_ip">
         <p>
-          Optional.  The tunnel destination IP that received packets must
-          match.  Default is to match all addresses.  If specified, may be one
-          of:
+          Optional. The tunnel destination IP that received packets must match.
+          Default is to match all addresses. If specified, may be one of:
         </p>
 
         <ul>
@@ -2333,9 +2717,9 @@
           <li>
             The word <code>flow</code>.  The tunnel accepts packets with any
             key.  The key will be placed in the <code>tun_id</code> field for
-            matching in the flow table.  The <code>ovs-ofctl</code> manual page
-            contains additional information about matching fields in OpenFlow
-            flows.
+            matching in the flow table.  The <code>ovs-fields</code>(7) manual
+            page contains additional information about matching fields in
+            OpenFlow flows.
           </li>
         </ul>
 
@@ -2361,10 +2745,15 @@
             The word <code>flow</code>.  Packets sent through the tunnel will
             have the key set using the <code>set_tunnel</code> Nicira OpenFlow
             vendor extension (0 is used in the absence of an action).  The
-            <code>ovs-ofctl</code> manual page contains additional information
-            about the Nicira OpenFlow vendor extensions.
+            <code>ovs-fields</code>(7) manual page contains additional
+            information about the Nicira OpenFlow vendor extensions.
           </li>
         </ul>
+      </column>
+
+      <column name="options" key="dst_port">
+        Optional.  The tunnel transport layer destination port, for UDP and TCP
+        based tunnel protocols (Geneve, VXLAN, LISP, and STT).
       </column>
 
       <column name="options" key="key">
@@ -2509,6 +2898,12 @@
               OpenFlow controllers that expect this behavior.
             </li>
             <li>
+              The <code>legacy_l3</code> option is only available via the
+              user space datapath.  The OVS kernel datapath does not support
+              devices of type ARPHRD_IPGRE which is the requirement for
+              <code>legacy_l3</code> type packets.
+            </li>
+            <li>
               If this option is <code>ptap</code>, the tunnel sends and
               receives any kind of packet.  Open vSwitch represents packets in
               the tunnel using the <code>packet_type</code> mechanism
@@ -2516,17 +2911,24 @@
             </li>
           </ul>
         </column>
+        <column name="options" key="seq" type='{"type": "boolean"}'>
+          <p>
+            Optional.  A 4-byte sequence number field for GRE tunnel only.
+            Default is disabled, set to <code>true</code> to enable.
+            Sequence number is incremented by one on each outgoing packet.
+          </p>
+        </column>
       </group>
 
-      <group title="Tunnel Options: gre, geneve, and vxlan">
+      <group title="Tunnel Options: gre, ip6gre, geneve, and vxlan">
         <p>
-          <code>gre</code>, <code>geneve</code>, and
-          <code>vxlan</code> interfaces support these options.
+          <code>gre</code>, <code>ip6gre</code>, <code>geneve</code>,
+          and <code>vxlan</code> interfaces support these options.
         </p>
 
         <column name="options" key="csum" type='{"type": "boolean"}'>
           <p>
-            Optional.  Compute encapsulation header (either GRE or UDP) 
+            Optional.  Compute encapsulation header (either GRE or UDP)
             checksums on outgoing packets.  Default is disabled, set to
             <code>true</code> to enable.  Checksums present on incoming
             packets will be validated regardless of this setting.
@@ -2535,8 +2937,9 @@
           <p>
             When using the upstream Linux kernel module, computation of
             checksums for <code>geneve</code> and <code>vxlan</code> requires
-            Linux kernel version 4.0 or higher. <code>gre</code> supports
-            checksums for all versions of Open vSwitch that support GRE.
+            Linux kernel version 4.0 or higher. <code>gre</code> and
+            <code>ip6gre</code> support checksums for all versions of
+            Open vSwitch that support GRE.
             The out of tree kernel module distributed as part of OVS
             can compute all tunnel checksums on any kernel version that it
             is compatible with.
@@ -2544,12 +2947,104 @@
 
         </column>
       </group>
+
+      <group title="Tunnel Options: IPsec">
+        <p>
+          Setting any of these options enables IPsec support for a given
+          tunnel.  <code>gre</code>, <code>ip6gre</code>,
+          <code>geneve</code>, <code>vxlan</code> and <code>stt</code>
+          interfaces support these options.  See the <code>IPsec</code>
+          section in the <ref table="Open_vSwitch"/> table for a description
+          of each mode.
+        </p>
+        <column name="options" key="psk" type='{"type": "string"}'>
+          <p>
+            In PSK mode only, the preshared secret to negotiate tunnel. This
+            value must match on both tunnel ends.
+          </p>
+        </column>
+        <column name="options" key="remote_cert" type='{"type": "string"}'>
+          <p>
+            In self-signed certificate mode only, name of a PEM file
+            containing a certificate of the remote switch.  The certificate
+            must be x.509 version 3 and with the string in common name (CN)
+            also set in the subject alternative name (SAN).
+          </p>
+        </column>
+        <column name="options" key="remote_name" type='{"type": "string"}'>
+          <p>
+            In CA-signed certificate mode only, common name (CN) of the remote
+            certificate.
+          </p>
+        </column>
+      </group>
+    </group>
+    <group title="Tunnel Options: erspan only">
+      <p>
+        Only <code>erspan</code> interfaces support these options.
+      </p>
+      <column name="options" key="erspan_idx">
+        <p>
+          20 bit index/port number associated with the ERSPAN traffic's
+          source port and direction (ingress/egress).  This field is
+          platform dependent.
+        </p>
+      </column>
+
+      <column name="options" key="erspan_ver">
+        <p>
+          ERSPAN version: 1 for version 1 (type II)
+          or 2 for version 2 (type III).
+        </p>
+      </column>
+
+      <column name="options" key="erspan_dir">
+        <p>
+          Specifies the ERSPAN v2 mirrored traffic's direction.
+          1 for egress traffic, and 0 for ingress traffic.
+        </p>
+      </column>
+
+      <column name="options" key="erspan_hwid">
+        <p>
+          ERSPAN hardware ID is a 6-bit unique identifier of an
+          ERSPAN v2 engine within a system.
+        </p>
+      </column>
     </group>
 
     <group title="Patch Options">
       <p>
-        Only <code>patch</code> interfaces support these options.
+        These options apply only to <dfn>patch ports</dfn>, that is, interfaces
+        whose <ref column="type"/> column is <code>patch</code>.  Patch ports
+        are mainly a way to connect otherwise independent bridges to one
+        another, similar to how one might plug an Ethernet cable (a ``patch
+        cable'') into two physical switches to connect those switches.  The
+        effect of plugging a patch port into two switches is conceptually
+        similar to that of plugging the two ends of a Linux <code>veth</code>
+        device into those switches, but the implementation of patch ports makes
+        them much more efficient.
       </p>
+
+      <p>
+        Patch ports may connect two different bridges (the usual case) or the
+        same bridge.  In the latter case, take special care to avoid loops,
+        e.g. by programming appropriate flows with OpenFlow.  Patch ports do
+        not work if its ends are attached to bridges on different datapaths,
+        e.g. to connect bridges in <code>system</code> and <code>netdev</code>
+        datapaths.
+      </p>
+
+      <p>
+        The following command creates and connects patch ports <code>p0</code>
+        and <code>p1</code> and adds them to bridges <code>br0</code> and
+        <code>br1</code>, respectively:
+      </p>
+
+      <pre>
+ovs-vsctl add-port br0 p0 -- set Interface p0 type=patch options:peer=p1 \
+       -- add-port br1 p1 -- set Interface p1 type=patch options:peer=p0
+      </pre>
 
       <column name="options" key="peer">
         The <ref column="name"/> of the <ref table="Interface"/> for the other
@@ -2612,12 +3107,50 @@
         </p>
       </column>
 
+      <column name="other_config" key="xdpmode"
+              type='{"type": "string",
+                     "enum": ["set", ["skb", "drv"]]}'>
+        <p>
+          Specifies the operational mode of the XDP program.
+          If "drv", the XDP program is loaded into the device driver with
+          zero-copy RX and TX enabled. This mode requires device driver with
+          AF_XDP support and has the best performance.
+          If "skb", the XDP program is using generic XDP mode in kernel with
+          extra data copying between userspace and kernel. No device driver
+          support is needed. Note that this is afxdp netdev type only.
+          Defaults to "skb" mode.
+        </p>
+      </column>
+
       <column name="options" key="vhost-server-path"
               type='{"type": "string"}'>
         <p>
           The value specifies the path to the socket associated with a vHost
           User client mode device that has been or will be created by QEMU.
           Only supported by dpdkvhostuserclient interfaces.
+        </p>
+      </column>
+
+      <column name="options" key="dq-zero-copy"
+              type='{"type": "boolean"}'>
+        <p>
+          The value specifies whether or not to enable dequeue zero copy on
+          the given interface.
+          Must be set before vhost-server-path is specified.
+          Only supported by dpdkvhostuserclient interfaces.
+          The feature is considered experimental.
+        </p>
+      </column>
+
+      <column name="options" key="tx-retries-max"
+              type='{"type": "integer", "minInteger": 0, "maxInteger": 32}'>
+        <p>
+          The value specifies the maximum amount of vhost tx retries that can
+          be made while trying to send a batch of packets to an interface.
+          Only supported by dpdkvhostuserclient interfaces.
+        </p>
+        <p>
+          Default value is 8.
         </p>
       </column>
 
@@ -2640,6 +3173,25 @@
           by the hardware of the device being configured.
           If not specified or an incorrect value is specified, 2048 tx
           descriptors will be used by default.
+        </p>
+      </column>
+    </group>
+
+    <group title="EMC (Exact Match Cache) Configuration">
+      <p>
+        These settings controls behaviour of EMC lookups/insertions for packets
+        received from the interface.
+      </p>
+
+      <column name="other_config" key="emc-enable" type='{"type": "boolean"}'>
+        <p>
+          Specifies if Exact Match Cache (EMC) should be used while processing
+          packets received from this interface.
+          If true, <ref table="Open_vSwitch" column="other_config"
+          key="emc-insert-inv-prob"/> will have effect on this interface.
+        </p>
+        <p>
+          Defaults to true.
         </p>
       </column>
     </group>
@@ -2782,6 +3334,70 @@
         Whether carrier is detected on <ref column="status"
         key="tunnel_egress_iface"/>.
       </column>
+
+      <group title="dpdk">
+        <p>
+          DPDK specific interface status options.
+        </p>
+
+          <column name="status" key="port_no">
+            DPDK port ID.
+          </column>
+
+          <column name="status" key="numa_id">
+            NUMA socket ID to which an Ethernet device is connected.
+          </column>
+
+          <column name="status" key="min_rx_bufsize">
+            Minimum size of RX buffer.
+          </column>
+
+          <column name="status" key="max_rx_pktlen">
+            Maximum configurable length of RX pkt.
+          </column>
+
+          <column name="status" key="max_rx_queues">
+            Maximum number of RX queues.
+          </column>
+
+          <column name="status" key="max_tx_queues">
+            Maximum number of TX queues.
+          </column>
+
+          <column name="status" key="max_mac_addrs">
+            Maximum number of MAC addresses.
+          </column>
+
+          <column name="status" key="max_hash_mac_addrs">
+            Maximum number of hash MAC addresses for MTA and UTA.
+          </column>
+
+          <column name="status" key="max_vfs">
+            Maximum number of hash MAC addresses for MTA and UTA.
+            Maximum number of VFs.
+          </column>
+
+          <column name="status" key="max_vmdq_pools">
+            Maximum number of VMDq pools.
+          </column>
+
+          <column name="status" key="if_type">
+            Interface type ID according to IANA ifTYPE MIB definitions.
+          </column>
+
+          <column name="status" key="if_descr">
+            Interface description string.
+          </column>
+
+          <column name="status" key="pci-vendor_id">
+            Vendor ID of PCI device.
+          </column>
+
+          <column name="status" key="pci-device_id">
+            Device ID of PCI device.
+          </column>
+
+      </group>
     </group>
 
     <group title="Statistics">
@@ -3479,6 +4095,23 @@
       </column>
     </group>
 
+    <group title="Link State Change detection mode">
+      <column name="options" key="dpdk-lsc-interrupt"
+              type='{"type": "boolean"}'>
+        <p>
+          Set this value to <code>true</code> to configure interrupt mode for
+          Link State Change (LSC) detection instead of poll mode for the DPDK
+          interface.
+        </p>
+        <p>
+          If this value is not set, poll mode is configured.
+        </p>
+        <p>
+          This parameter has an effect only on netdev dpdk interfaces.
+        </p>
+      </column>
+    </group>
+
     <group title="Common Columns">
       The overall purpose of these columns is described under <code>Common
       Columns</code> at the beginning of this document.
@@ -3746,6 +4379,14 @@
           for information on how this classifier works.
         </dd>
 
+        <dt><code>linux-netem</code></dt>
+        <dd>
+          Linux ``Network Emulator'' classifier. See
+          <code>tc-netem</code>(8) (also at
+          <code>http://man7.org/linux/man-pages/man8/tc-netem.8.html</code>)
+          for information on how this classifier works.
+        </dd>
+
         <dt><code>linux-noop</code></dt>
         <dd>
           Linux ``No operation.''  By default, Open vSwitch manages quality of
@@ -3834,6 +4475,45 @@
         be transmitted then the cbs will be decremented by the number of
         bytes/tokens of the packet. If there are not enough tokens in the cbs
         bucket the packet will be dropped.
+      </column>
+    </group>
+
+    <group title="Configuration for linux-sfq">
+      <p>
+        The <code>linux-sfq</code> QoS supports the following key-value pairs:
+      </p>
+
+      <column name="other_config" key="perturb" type='{"type": "integer"}'>
+        Number of seconds between consecutive perturbations in hashing algorithm.
+        Different flows can end up in the same hash bucket causing unfairness.
+        Perturbation's goal is to remove possible unfairness.
+        The default and recommended value is 10. Too low a value is discouraged
+        because each perturbation can cause packet reordering.
+      </column>
+      <column name="other_config" key="quantum" type='{"type": "integer"}'>
+        Number of bytes <code>linux-sfq</code> QoS can dequeue in one turn in
+        round-robin from one flow. The default and recommended value is equal
+        to interface's MTU.
+      </column>
+    </group>
+
+    <group title="Configuration for linux-netem">
+      <p>
+        The <code>linux-netem</code> QoS supports the following key-value
+        pairs:
+      </p>
+
+      <column name="other_config" key="latency" type='{"type": "integer"}'>
+        Adds the chosen delay to the packets outgoing to chosen network
+        interface. The latency value expressed in us.
+      </column>
+      <column name="other_config" key="limit" type='{"type": "integer"}'>
+        Maximum number of packets the qdisc may hold queued at a time.
+        The default value is 1000.
+      </column>
+      <column name="other_config" key="loss" type='{"type": "integer"}'>
+        Adds an independent loss probability to the packets outgoing from the
+        chosen network interface.
       </column>
     </group>
 
@@ -4092,93 +4772,85 @@
   <table name="Controller" title="OpenFlow controller configuration.">
     <p>An OpenFlow controller.</p>
 
-    <p>
-      Open vSwitch supports two kinds of OpenFlow controllers:
-    </p>
-
-    <dl>
-      <dt>Primary controllers</dt>
-      <dd>
-        <p>
-          This is the kind of controller envisioned by the OpenFlow 1.0
-          specification.  Usually, a primary controller implements a network
-          policy by taking charge of the switch's flow table.
-        </p>
-
-        <p>
-          Open vSwitch initiates and maintains persistent connections to
-          primary controllers, retrying the connection each time it fails or
-          drops.  The <ref table="Bridge" column="fail_mode"/> column in the
-          <ref table="Bridge"/> table applies to primary controllers.
-        </p>
-
-        <p>
-          Open vSwitch permits a bridge to have any number of primary
-          controllers.  When multiple controllers are configured, Open
-          vSwitch connects to all of them simultaneously.  Because
-          OpenFlow 1.0 does not specify how multiple controllers
-          coordinate in interacting with a single switch, more than
-          one primary controller should be specified only if the
-          controllers are themselves designed to coordinate with each
-          other.  (The Nicira-defined <code>NXT_ROLE</code> OpenFlow
-          vendor extension may be useful for this.)
-        </p>
-      </dd>
-      <dt>Service controllers</dt>
-      <dd>
-        <p>
-          These kinds of OpenFlow controller connections are intended for
-          occasional support and maintenance use, e.g. with
-          <code>ovs-ofctl</code>.  Usually a service controller connects only
-          briefly to inspect or modify some of a switch's state.
-        </p>
-
-        <p>
-          Open vSwitch listens for incoming connections from service
-          controllers.  The service controllers initiate and, if necessary,
-          maintain the connections from their end.  The <ref table="Bridge"
-          column="fail_mode"/> column in the <ref table="Bridge"/> table does
-          not apply to service controllers.
-        </p>
-
-        <p>
-          Open vSwitch supports configuring any number of service controllers.
-        </p>
-      </dd>
-    </dl>
-
-    <p>
-      The <ref column="target"/> determines the type of controller.
-    </p>
-
     <group title="Core Features">
+      <column name="type">
+        <p>
+          Open vSwitch supports two kinds of OpenFlow controllers.  A bridge
+          may have any number of each kind:
+        </p>
+
+        <dl>
+          <dt>Primary controllers</dt>
+          <dd>
+            <p>
+              This is the kind of controller envisioned by the OpenFlow
+              specifications.  Usually, a primary controller implements a
+              network policy by taking charge of the switch's flow table.
+            </p>
+
+            <p>
+              The <ref table="Bridge" column="fail_mode"/> column in the <ref
+              table="Bridge"/> table applies to primary controllers.
+            </p>
+
+            <p>
+              When multiple primary controllers are configured, Open vSwitch
+              connects to all of them simultaneously.  OpenFlow provides few
+              facilities to allow multiple controllers to coordinate in
+              interacting with a single switch, so more than one primary
+              controller should be specified only if the controllers are
+              themselves designed to coordinate with each other.
+            </p>
+          </dd>
+          <dt>Service controllers</dt>
+          <dd>
+            <p>
+              These kinds of OpenFlow controller connections are intended for
+              occasional support and maintenance use, e.g. with
+              <code>ovs-ofctl</code>.  Usually a service controller connects
+              only briefly to inspect or modify some of a switch's state.
+            </p>
+
+            <p>
+              The <ref table="Bridge" column="fail_mode"/> column in the <ref
+              table="Bridge"/> table does not apply to service controllers.
+            </p>
+          </dd>
+        </dl>
+
+        <p>
+          By default, Open vSwitch treats controllers with active connection
+          methods as primary controllers and those with passive connection
+          methods as service controllers.  Set this column to the desired type
+          to override this default.
+        </p>
+      </column>
+
       <column name="target">
         <p>Connection method for controller.</p>
         <p>
-          The following connection methods are currently supported for primary
-          controllers:
+          The following active connection methods are currently supported:
         </p>
         <dl>
-          <dt><code>ssl:<var>ip</var></code>[<code>:<var>port</var></code>]</dt>
+          <dt><code>ssl:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>The specified SSL <var>port</var> on the host at the
-            given <var>ip</var>, which must be expressed as an IP
-            address (not a DNS name).  The <ref table="Open_vSwitch"
-            column="ssl"/> column in the <ref table="Open_vSwitch"/>
-            table must point to a valid SSL configuration when this form
-            is used.</p>
+            given <var>host</var>, which can either be a DNS name (if built
+            with unbound library) or an IP address.  The <ref table="Open_vSwitch"
+            column="ssl"/> column in the <ref table="Open_vSwitch"/> table must
+            point to a valid SSL configuration when this form is used.</p>
             <p>If <var>port</var> is not specified, it defaults to 6653.</p>
             <p>SSL support is an optional feature that is not always built as
             part of Open vSwitch.</p>
           </dd>
-          <dt><code>tcp:<var>ip</var></code>[<code>:<var>port</var></code>]</dt>
+          <dt><code>tcp:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>
               The specified TCP <var>port</var> on the host at the given
-              <var>ip</var>, which must be expressed as an IP address (not a
-              DNS name), where <var>ip</var> can be IPv4 or IPv6 address.  If
-              <var>ip</var> is an IPv6 address, wrap it in square brackets,
-              e.g. <code>tcp:[::1]:6653</code>.
+              <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address (IPv4 or IPv6). If <var>host</var>
+              is an IPv6 address, wrap it in square brackets, e.g.
+              <code>tcp:[::1]:6653</code>.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6653.
@@ -4186,23 +4858,22 @@
           </dd>
         </dl>
         <p>
-          The following connection methods are currently supported for service
-          controllers:
+          The following passive connection methods are currently supported:
         </p>
         <dl>
-          <dt><code>pssl:</code>[<var>port</var>][<code>:<var>ip</var></code>]</dt>
+          <dt><code>pssl:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
               Listens for SSL connections on the specified TCP <var>port</var>.
-              If <var>ip</var>, which must be expressed as an IP address (not a
-              DNS name), is specified, then connections are restricted to the
-              specified local IP address (either IPv4 or IPv6).  If
-              <var>ip</var> is an IPv6 address, wrap it in square brackets,
-              e.g. <code>pssl:6653:[::1]</code>.
+              If <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address, is specified, then connections
+              are restricted to the resolved or specified local IP address
+              (either IPv4 or IPv6).  If <var>host</var> is an IPv6 address,
+              wrap it in square brackets, e.g. <code>pssl:6653:[::1]</code>.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to
-              6653.  If <var>ip</var> is not specified then it listens only on
+              6653.  If <var>host</var> is not specified then it listens only on
               IPv4 (but not IPv6) addresses.  The
               <ref table="Open_vSwitch" column="ssl"/>
               column in the <ref table="Open_vSwitch"/> table must point to a
@@ -4216,16 +4887,17 @@
               part of Open vSwitch.
             </p>
           </dd>
-          <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>ip</var></code>]</dt>
+          <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
               Listens for connections on the specified TCP <var>port</var>.  If
-              <var>ip</var>, which must be expressed as an IP address (not a
-              DNS name), is specified, then connections are restricted to the
-              specified local IP address (either IPv4 or IPv6).  If
-              <var>ip</var> is an IPv6 address, wrap it in square brackets,
-              e.g. <code>ptcp:6653:[::1]</code>. If <var>ip</var> is not
-              specified then it listens only on IPv4 addresses.
+              <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address, is specified, then connections
+              are restricted to the resolved or specified local IP address
+              (either IPv4 or IPv6).  If <var>host</var> is an IPv6 address, wrap
+              it in square brackets, e.g. <code>ptcp:6653:[::1]</code>. If
+              <var>host</var> is not specified then it listens only on IPv4
+              addresses.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6653.
@@ -4562,12 +5234,12 @@
           The following connection methods are currently supported:
         </p>
         <dl>
-          <dt><code>ssl:<var>ip</var></code>[<code>:<var>port</var></code>]</dt>
+          <dt><code>ssl:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>
               The specified SSL <var>port</var> on the host at the given
-              <var>ip</var>, which must be expressed as an IP address
-              (not a DNS name).  The <ref table="Open_vSwitch"
+              <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address.  The <ref table="Open_vSwitch"
               column="ssl"/> column in the <ref table="Open_vSwitch"/>
               table must point to a valid SSL configuration when this
               form is used.
@@ -4581,30 +5253,30 @@
             </p>
           </dd>
 
-          <dt><code>tcp:<var>ip</var></code>[<code>:<var>port</var></code>]</dt>
+          <dt><code>tcp:<var>host</var></code>[<code>:<var>port</var></code>]</dt>
           <dd>
             <p>
               The specified TCP <var>port</var> on the host at the given
-              <var>ip</var>, which must be expressed as an IP address (not a
-              DNS name), where <var>ip</var> can be IPv4 or IPv6 address.  If
-              <var>ip</var> is an IPv6 address, wrap it in square brackets,
-              e.g. <code>tcp:[::1]:6640</code>.
+              <var>host</var>, which can either be a DNS name (if built with
+              unbound library) or an IP address (IPv4 or IPv6).  If <var>host</var>
+              is an IPv6 address, wrap it in square brackets, e.g.
+              <code>tcp:[::1]:6640</code>.
             </p>
             <p>
               If <var>port</var> is not specified, it defaults to 6640.
             </p>
           </dd>
-          <dt><code>pssl:</code>[<var>port</var>][<code>:<var>ip</var></code>]</dt>
+          <dt><code>pssl:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
               Listens for SSL connections on the specified TCP <var>port</var>.
               Specify 0 for <var>port</var> to have the kernel automatically
-              choose an available port.  If <var>ip</var>, which must be
-              expressed as an IP address (not a DNS name), is specified, then
-              connections are restricted to the specified local IP address
-              (either IPv4 or IPv6 address).  If <var>ip</var> is an IPv6
-              address, wrap in square brackets,
-              e.g. <code>pssl:6640:[::1]</code>.  If <var>ip</var> is not
+              choose an available port.  If <var>host</var>, which can either
+              be a DNS name (if built with unbound library) or an IP address,
+              is specified, then connections are restricted to the resolved or
+              specified local IP address (either IPv4 or IPv6 address).  If
+              <var>host</var> is an IPv6 address, wrap in square brackets,
+              e.g. <code>pssl:6640:[::1]</code>.  If <var>host</var> is not
               specified then it listens only on IPv4 (but not IPv6) addresses.
               The <ref table="Open_vSwitch" column="ssl"/> column in the <ref
               table="Open_vSwitch"/> table must point to a valid SSL
@@ -4618,17 +5290,17 @@
               part of Open vSwitch.
             </p>
           </dd>
-          <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>ip</var></code>]</dt>
+          <dt><code>ptcp:</code>[<var>port</var>][<code>:<var>host</var></code>]</dt>
           <dd>
             <p>
               Listens for connections on the specified TCP <var>port</var>.
               Specify 0 for <var>port</var> to have the kernel automatically
-              choose an available port.  If <var>ip</var>, which must be
-              expressed as an IP address (not a DNS name), is specified, then
-              connections are restricted to the specified local IP address
-              (either IPv4 or IPv6 address).  If <var>ip</var> is an IPv6
-              address, wrap it in square brackets,
-              e.g. <code>ptcp:6640:[::1]</code>.  If <var>ip</var> is not
+              choose an available port.  If <var>host</var>, which can either
+              be a DNS name (if built with unbound library) or an IP address,
+              is specified, then connections are restricted to the resolved or
+              specified local IP address (either IPv4 or IPv6 address).  If
+              <var>host</var> is an IPv6 address, wrap it in square brackets,
+              e.g. <code>ptcp:6640:[::1]</code>.  If <var>host</var> is not
               specified then it listens only on IPv4 addresses.
             </p>
             <p>
@@ -4932,13 +5604,24 @@
     monitoring of switches.</p>
 
     <column name="agent">
-      Name of the network device whose IP address should be reported as the
-      ``agent address'' to collectors.  If not specified, the agent device is
-      figured from the first target address and the routing table.  If the
-      routing table does not contain a route to the target, the IP address
-      defaults to the <ref table="Controller" column="local_ip"/> in the
-      collector's <ref table="Controller"/>.  If an agent IP address cannot be
-      determined any of these ways, sFlow is disabled.
+      <p>
+        Determines the agent address, that is, the IP address reported to
+        collectors as the source of the sFlow data.  It may be an IP address or
+        the name of a network device.  In the latter case, the network device's
+        IP address is used,
+      </p>
+
+      <p>
+        If not specified, the agent device is figured from the first target
+        address and the routing table.  If the routing table does not contain a
+        route to the target, the IP address defaults to the <ref
+        table="Controller" column="local_ip"/> in the collector's <ref
+        table="Controller"/>.
+      </p>
+
+      <p>
+        If an agent IP address cannot be determined, sFlow is disabled.
+      </p>
     </column>
 
     <column name="header">
@@ -4999,7 +5682,7 @@
         <p>
           With <em>flow-based sampling</em>, <code>sample</code> actions in the
           OpenFlow flow table drive IPFIX sampling.  See
-          <code>ovs-ofctl</code>(8) for a description of the
+          <code>ovs-actions</code>(7) for a description of the
           <code>sample</code> action.
         </p>
 

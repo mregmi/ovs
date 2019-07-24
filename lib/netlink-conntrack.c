@@ -18,6 +18,7 @@
 
 #include "netlink-conntrack.h"
 
+#include <errno.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
 #include <linux/netfilter/nf_conntrack_common.h>
@@ -32,7 +33,7 @@
 #include "netlink-socket.h"
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "util.h"
@@ -111,6 +112,8 @@ static bool nl_ct_parse_header_policy(struct ofpbuf *buf,
 static bool nl_ct_attrs_to_ct_dpif_entry(struct ct_dpif_entry *entry,
         struct nlattr *attrs[ARRAY_SIZE(nfnlgrp_conntrack_policy)],
         uint8_t nfgen_family);
+static bool nl_ct_put_ct_tuple(struct ofpbuf *buf,
+        const struct ct_dpif_tuple *tuple, enum ctattr_type type);
 
 struct nl_ct_dump_state {
     struct nl_dump dump;
@@ -239,6 +242,27 @@ nl_ct_flush(void)
     return err;
 }
 
+int
+nl_ct_flush_tuple(const struct ct_dpif_tuple *tuple, uint16_t zone)
+{
+    int err;
+    struct ofpbuf buf;
+
+    ofpbuf_init(&buf, NL_DUMP_BUFSIZE);
+    nl_msg_put_nfgenmsg(&buf, 0, tuple->l3_type, NFNL_SUBSYS_CTNETLINK,
+                        IPCTNL_MSG_CT_DELETE, NLM_F_REQUEST);
+
+    nl_msg_put_be16(&buf, CTA_ZONE, htons(zone));
+    if (!nl_ct_put_ct_tuple(&buf, tuple, CTA_TUPLE_ORIG)) {
+        err = EOPNOTSUPP;
+        goto out;
+    }
+    err = nl_transact(NETLINK_NETFILTER, &buf, NULL);
+out:
+    ofpbuf_uninit(&buf);
+    return err;
+}
+
 #ifdef _WIN32
 int
 nl_ct_flush_zone(uint16_t flush_zone)
@@ -251,7 +275,7 @@ nl_ct_flush_zone(uint16_t flush_zone)
 
     nl_msg_put_nfgenmsg(&buf, 0, AF_UNSPEC, NFNL_SUBSYS_CTNETLINK,
                         IPCTNL_MSG_CT_DELETE, NLM_F_REQUEST);
-    nl_msg_put_be16(&buf, CTA_ZONE, flush_zone);
+    nl_msg_put_be16(&buf, CTA_ZONE, htons(flush_zone));
 
     err = nl_transact(NETLINK_NETFILTER, &buf, NULL);
     ofpbuf_uninit(&buf);
@@ -517,6 +541,79 @@ nl_ct_parse_tuple(struct nlattr *nla, struct ct_dpif_tuple *tuple,
     return parsed;
 }
 
+static bool
+nl_ct_put_tuple_ip(struct ofpbuf *buf, const struct ct_dpif_tuple *tuple)
+{
+    size_t offset = nl_msg_start_nested(buf, CTA_TUPLE_IP);
+
+    if (tuple->l3_type == AF_INET) {
+        nl_msg_put_be32(buf, CTA_IP_V4_SRC, tuple->src.ip);
+        nl_msg_put_be32(buf, CTA_IP_V4_DST, tuple->dst.ip);
+    } else if (tuple->l3_type == AF_INET6) {
+        nl_msg_put_in6_addr(buf, CTA_IP_V6_SRC, &tuple->src.in6);
+        nl_msg_put_in6_addr(buf, CTA_IP_V6_DST, &tuple->dst.in6);
+    } else {
+        VLOG_WARN_RL(&rl, "Unsupported IP protocol: %"PRIu16".",
+                     tuple->l3_type);
+        return false;
+    }
+
+    nl_msg_end_nested(buf, offset);
+    return true;
+}
+
+static bool
+nl_ct_put_tuple_proto(struct ofpbuf *buf, const struct ct_dpif_tuple *tuple)
+{
+    size_t offset = nl_msg_start_nested(buf, CTA_TUPLE_PROTO);
+
+    nl_msg_put_u8(buf, CTA_PROTO_NUM, tuple->ip_proto);
+
+    if (tuple->l3_type == AF_INET && tuple->ip_proto == IPPROTO_ICMP) {
+        nl_msg_put_be16(buf, CTA_PROTO_ICMP_ID, tuple->icmp_id);
+        nl_msg_put_u8(buf, CTA_PROTO_ICMP_TYPE, tuple->icmp_type);
+        nl_msg_put_u8(buf, CTA_PROTO_ICMP_CODE, tuple->icmp_code);
+    } else if (tuple->l3_type == AF_INET6 &&
+               tuple->ip_proto == IPPROTO_ICMPV6) {
+        nl_msg_put_be16(buf, CTA_PROTO_ICMPV6_ID, tuple->icmp_id);
+        nl_msg_put_u8(buf, CTA_PROTO_ICMPV6_TYPE, tuple->icmp_type);
+        nl_msg_put_u8(buf, CTA_PROTO_ICMPV6_CODE, tuple->icmp_code);
+    } else if (tuple->ip_proto == IPPROTO_TCP ||
+               tuple->ip_proto == IPPROTO_UDP) {
+        nl_msg_put_be16(buf, CTA_PROTO_SRC_PORT, tuple->src_port);
+        nl_msg_put_be16(buf, CTA_PROTO_DST_PORT, tuple->dst_port);
+    } else {
+        VLOG_WARN_RL(&rl, "Unsupported L4 protocol: %"PRIu8".",
+                     tuple->ip_proto);
+        return false;
+    }
+
+    nl_msg_end_nested(buf, offset);
+    return true;
+}
+
+static bool
+nl_ct_put_ct_tuple(struct ofpbuf *buf, const struct ct_dpif_tuple *tuple,
+                   enum ctattr_type type)
+{
+    if (type != CTA_TUPLE_ORIG && type != CTA_TUPLE_REPLY &&
+        type != CTA_TUPLE_MASTER) {
+        return false;
+    }
+
+    size_t offset = nl_msg_start_nested(buf, type);
+
+    if (!nl_ct_put_tuple_ip(buf, tuple)) {
+        return false;
+    }
+    if (!nl_ct_put_tuple_proto(buf, tuple)) {
+        return false;
+    }
+
+    nl_msg_end_nested(buf, offset);
+    return true;
+}
+
 /* Translate netlink TCP state to CT_DPIF_TCP state. */
 static uint8_t
 nl_ct_tcp_state_to_dpif(uint8_t state)
@@ -563,7 +660,7 @@ ip_ct_tcp_flags_to_dpif(uint8_t flags)
 #define CT_DPIF_TCP_FLAG(FLAG) \
         ret |= (flags & IP_CT_TCP_FLAG_##FLAG) ? CT_DPIF_TCPF_##FLAG : 0;
     CT_DPIF_TCP_FLAGS
-#undef CT_DPIF_STATUS_FLAG
+#undef CT_DPIF_TCP_FLAG
     return ret;
 #endif
 }
@@ -620,6 +717,73 @@ nl_ct_parse_protoinfo_tcp(struct nlattr *nla,
     return parsed;
 }
 
+/* Translate netlink SCTP state to CT_DPIF_SCTP state. */
+static uint8_t
+nl_ct_sctp_state_to_dpif(uint8_t state)
+{
+#ifdef _WIN32
+    /* For now, return the CT_DPIF_SCTP state. Not sure what windows does. */
+    return state;
+#else
+    switch (state) {
+    case SCTP_CONNTRACK_COOKIE_WAIT:
+        return CT_DPIF_SCTP_STATE_COOKIE_WAIT;
+    case SCTP_CONNTRACK_COOKIE_ECHOED:
+        return CT_DPIF_SCTP_STATE_COOKIE_ECHOED;
+    case SCTP_CONNTRACK_ESTABLISHED:
+        return CT_DPIF_SCTP_STATE_ESTABLISHED;
+    case SCTP_CONNTRACK_SHUTDOWN_SENT:
+        return CT_DPIF_SCTP_STATE_SHUTDOWN_SENT;
+    case SCTP_CONNTRACK_SHUTDOWN_RECD:
+        return CT_DPIF_SCTP_STATE_SHUTDOWN_RECD;
+    case SCTP_CONNTRACK_SHUTDOWN_ACK_SENT:
+        return CT_DPIF_SCTP_STATE_SHUTDOWN_ACK_SENT;
+    case SCTP_CONNTRACK_HEARTBEAT_SENT:
+        return CT_DPIF_SCTP_STATE_HEARTBEAT_SENT;
+    case SCTP_CONNTRACK_HEARTBEAT_ACKED:
+        return CT_DPIF_SCTP_STATE_HEARTBEAT_ACKED;
+    case SCTP_CONNTRACK_CLOSED:
+        /* Fall Through. */
+    case SCTP_CONNTRACK_NONE:
+        /* Fall Through. */
+    default:
+        return CT_DPIF_SCTP_STATE_CLOSED;
+    }
+#endif
+}
+
+static bool
+nl_ct_parse_protoinfo_sctp(struct nlattr *nla,
+                           struct ct_dpif_protoinfo *protoinfo)
+{
+    static const struct nl_policy policy[] = {
+        [CTA_PROTOINFO_SCTP_STATE] = { .type = NL_A_U8, .optional = false },
+        [CTA_PROTOINFO_SCTP_VTAG_ORIGINAL] = { .type = NL_A_U32,
+                                               .optional = false },
+        [CTA_PROTOINFO_SCTP_VTAG_REPLY] = { .type = NL_A_U32,
+                                            .optional = false },
+    };
+    struct nlattr *attrs[ARRAY_SIZE(policy)];
+    bool parsed;
+
+    parsed = nl_parse_nested(nla, policy, attrs, ARRAY_SIZE(policy));
+    if (parsed) {
+        protoinfo->proto = IPPROTO_SCTP;
+
+        protoinfo->sctp.state = nl_ct_sctp_state_to_dpif(
+            nl_attr_get_u8(attrs[CTA_PROTOINFO_SCTP_STATE]));
+        protoinfo->sctp.vtag_orig = nl_attr_get_u32(
+            attrs[CTA_PROTOINFO_SCTP_VTAG_ORIGINAL]);
+        protoinfo->sctp.vtag_reply = nl_attr_get_u32(
+            attrs[CTA_PROTOINFO_SCTP_VTAG_REPLY]);
+    } else {
+        VLOG_ERR_RL(&rl, "Could not parse nested SCTP protoinfo options. "
+                    "Possibly incompatible Linux kernel version.");
+    }
+
+    return parsed;
+}
+
 static bool
 nl_ct_parse_protoinfo(struct nlattr *nla, struct ct_dpif_protoinfo *protoinfo)
 {
@@ -640,7 +804,8 @@ nl_ct_parse_protoinfo(struct nlattr *nla, struct ct_dpif_protoinfo *protoinfo)
             parsed = nl_ct_parse_protoinfo_tcp(attrs[CTA_PROTOINFO_TCP],
                                                protoinfo);
         } else if (attrs[CTA_PROTOINFO_SCTP]) {
-            VLOG_WARN_RL(&rl, "SCTP protoinfo not yet supported!");
+            parsed = nl_ct_parse_protoinfo_sctp(attrs[CTA_PROTOINFO_SCTP],
+                                                protoinfo);
         } else {
             VLOG_WARN_RL(&rl, "Empty protoinfo!");
         }

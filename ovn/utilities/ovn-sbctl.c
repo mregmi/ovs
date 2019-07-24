@@ -36,6 +36,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/json.h"
 #include "openvswitch/ofp-actions.h"
+#include "openvswitch/ofp-flow.h"
 #include "openvswitch/ofp-print.h"
 #include "openvswitch/shash.h"
 #include "openvswitch/vconn.h"
@@ -44,7 +45,7 @@
 #include "ovn/lib/ovn-util.h"
 #include "ovsdb-data.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "process.h"
 #include "sset.h"
 #include "stream-ssl.h"
@@ -68,7 +69,7 @@ static bool oneline;
 static bool dry_run;
 
 /* --timeout: Time to wait for a connection to 'db'. */
-static int timeout;
+static unsigned int timeout;
 
 /* Format for table output. */
 static struct table_style table_style = TABLE_STYLE_DEFAULT;
@@ -79,6 +80,9 @@ static struct table_style table_style = TABLE_STYLE_DEFAULT;
 static struct ovsdb_idl *the_idl;
 static struct ovsdb_idl_txn *the_idl_txn;
 OVS_NO_RETURN static void sbctl_exit(int status);
+
+/* --leader-only, --no-leader-only: Only accept the leader in a cluster. */
+static int leader_only = true;
 
 static void sbctl_cmd_init(void);
 OVS_NO_RETURN static void usage(void);
@@ -96,7 +100,6 @@ main(int argc, char *argv[])
     struct shash local_options;
     unsigned int seqno;
     size_t n_commands;
-    char *args;
 
     set_program_name(argv[0]);
     fatal_ignore_sigpipe();
@@ -105,22 +108,23 @@ main(int argc, char *argv[])
 
     sbctl_cmd_init();
 
-    /* Log our arguments.  This is often valuable for debugging systems. */
-    args = process_escape_args(argv);
-    VLOG(ctl_might_write_to_db(argv) ? VLL_INFO : VLL_DBG, "Called as %s", args);
-
     /* Parse command line. */
+    char *args = process_escape_args(argv);
     shash_init(&local_options);
     parse_options(argc, argv, &local_options);
-    commands = ctl_parse_commands(argc - optind, argv + optind, &local_options,
-                                  &n_commands);
-
-    if (timeout) {
-        time_alarm(timeout);
+    char *error = ctl_parse_commands(argc - optind, argv + optind,
+                                     &local_options, &commands, &n_commands);
+    if (error) {
+        ctl_fatal("%s", error);
     }
+    VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
+         "Called as %s", args);
+
+    ctl_timeout_setup(timeout);
 
     /* Initialize IDL. */
-    idl = the_idl = ovsdb_idl_create(db, &sbrec_idl_class, false, false);
+    idl = the_idl = ovsdb_idl_create(db, &sbrec_idl_class, false, true);
+    ovsdb_idl_set_leader_only(idl, leader_only);
     run_prerequisites(commands, n_commands, idl);
 
     /* Execute the commands.
@@ -165,6 +169,7 @@ parse_options(int argc, char *argv[], struct shash *local_options)
         OPT_LOCAL,
         OPT_COMMANDS,
         OPT_OPTIONS,
+        OPT_BOOTSTRAP_CA_CERT,
         VLOG_OPTION_ENUMS,
         TABLE_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
@@ -178,9 +183,12 @@ parse_options(int argc, char *argv[], struct shash *local_options)
         {"help", no_argument, NULL, 'h'},
         {"commands", no_argument, NULL, OPT_COMMANDS},
         {"options", no_argument, NULL, OPT_OPTIONS},
+        {"leader-only", no_argument, &leader_only, true},
+        {"no-leader-only", no_argument, &leader_only, false},
         {"version", no_argument, NULL, 'V'},
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
+        {"bootstrap-ca-cert", required_argument, NULL, OPT_BOOTSTRAP_CA_CERT},
         TABLE_LONG_OPTIONS,
         {NULL, 0, NULL, 0},
     };
@@ -258,8 +266,7 @@ parse_options(int argc, char *argv[], struct shash *local_options)
             exit(EXIT_SUCCESS);
 
         case 't':
-            timeout = strtoul(optarg, NULL, 10);
-            if (timeout < 0) {
+            if (!str_to_uint(optarg, 10, &timeout) || !timeout) {
                 ctl_fatal("value %s on -t or --timeout is invalid", optarg);
             }
             break;
@@ -268,11 +275,18 @@ parse_options(int argc, char *argv[], struct shash *local_options)
         TABLE_OPTION_HANDLERS(&table_style)
         STREAM_SSL_OPTION_HANDLERS
 
+        case OPT_BOOTSTRAP_CA_CERT:
+            stream_ssl_set_ca_cert_file(optarg, true);
+            break;
+
         case '?':
             exit(EXIT_FAILURE);
 
         default:
             abort();
+
+        case 0:
+            break;
         }
     }
     free(short_options);
@@ -316,6 +330,7 @@ Logical flow commands:\n\
 Connection commands:\n\
   get-connection             print the connections\n\
   del-connection             delete the connections\n\
+  [--inactivity-probe=MSECS]\n\
   set-connection TARGET...   set the list of connections to TARGET...\n\
 \n\
 SSL commands:\n\
@@ -325,15 +340,17 @@ SSL commands:\n\
 set the SSL configuration\n\
 \n\
 %s\
+%s\
 \n\
 Options:\n\
   --db=DATABASE               connect to DATABASE\n\
                               (default: %s)\n\
+  --no-leader-only            accept any cluster member, not just the leader\n\
   -t, --timeout=SECS          wait at most SECS seconds\n\
   --dry-run                   do not commit changes to database\n\
   --oneline                   print exactly one line of output per command\n",
            program_name, program_name, ctl_get_db_cmd_usage(),
-           default_sb_db());
+           ctl_list_db_tables_usage(), default_sb_db());
     table_usage();
     vlog_usage();
     printf("\
@@ -342,7 +359,7 @@ Options:\n\
 Other options:\n\
   -h, --help                  display this help message\n\
   -V, --version               display version information\n");
-    stream_usage("database", true, true, false);
+    stream_usage("database", true, true, true);
     exit(EXIT_SUCCESS);
 }
 
@@ -507,6 +524,9 @@ pre_get_info(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &sbrec_logical_flow_col_external_ids);
 
     ovsdb_idl_add_column(ctx->idl, &sbrec_datapath_binding_col_external_ids);
+
+    ovsdb_idl_add_column(ctx->idl, &sbrec_ip_multicast_col_datapath);
+    ovsdb_idl_add_column(ctx->idl, &sbrec_ip_multicast_col_seq_no);
 }
 
 static struct cmd_show_table cmd_show_tables[] = {
@@ -760,7 +780,7 @@ sbctl_open_vconn(struct shash *options)
 
     char *remote = ovs->data ? xstrdup(ovs->data) : default_ovs();
     struct vconn *vconn;
-    int retval = vconn_open_block(remote, 1 << OFP13_VERSION, 0, &vconn);
+    int retval = vconn_open_block(remote, 1 << OFP13_VERSION, 0, -1, &vconn);
     if (retval) {
         VLOG_WARN("%s: connection failed (%s)", remote, ovs_strerror(retval));
     }
@@ -796,7 +816,7 @@ sbctl_dump_openflow(struct vconn *vconn, const struct uuid *uuid, bool stats)
 
             ds_clear(&s);
             if (stats) {
-                ofp_print_flow_stats(&s, fs, NULL, true);
+                ofputil_flow_stats_format(&s, fs, NULL, NULL, true);
             } else {
                 ds_put_format(&s, "%stable=%s%"PRIu8" ",
                               colors.special, colors.end, fs->table_id);
@@ -806,7 +826,8 @@ sbctl_dump_openflow(struct vconn *vconn, const struct uuid *uuid, bool stats)
                 }
 
                 ds_put_format(&s, "%sactions=%s", colors.actions, colors.end);
-                ofpacts_format(fs->ofpacts, fs->ofpacts_len, NULL, &s);
+                struct ofpact_format_params fp = { .s = &s };
+                ofpacts_format(fs->ofpacts, fs->ofpacts_len, &fp);
             }
             printf("    %s\n", ds_cstr(&s));
         }
@@ -824,9 +845,14 @@ cmd_lflow_list(struct ctl_context *ctx)
 {
     const struct sbrec_datapath_binding *datapath = NULL;
     if (ctx->argc > 1) {
-        datapath = (const struct sbrec_datapath_binding *)
-            ctl_get_row(ctx, &sbrec_table_datapath_binding,
-                        ctx->argv[1], false);
+        const struct ovsdb_idl_row *row;
+        char *error = ctl_get_row(ctx, &sbrec_table_datapath_binding,
+                                  ctx->argv[1], false, &row);
+        if (error) {
+            ctl_fatal("%s", error);
+        }
+
+        datapath = (const struct sbrec_datapath_binding *)row;
         if (datapath) {
             ctx->argc--;
             ctx->argv++;
@@ -860,7 +886,10 @@ cmd_lflow_list(struct ctl_context *ctx)
         lflows[n_flows] = lflow;
         n_flows++;
     }
-    qsort(lflows, n_flows, sizeof *lflows, lflow_cmp);
+
+    if (n_flows) {
+        qsort(lflows, n_flows, sizeof *lflows, lflow_cmp);
+    }
 
     bool print_uuid = shash_find(&ctx->options, "--uuid") != NULL;
 
@@ -929,6 +958,52 @@ cmd_lflow_list(struct ctl_context *ctx)
 }
 
 static void
+sbctl_ip_mcast_flush_switch(struct ctl_context *ctx,
+                            const struct sbrec_datapath_binding *dp)
+{
+    const struct sbrec_ip_multicast *ip_mcast;
+
+    /* Lookup the corresponding IP_Multicast entry. */
+    SBREC_IP_MULTICAST_FOR_EACH (ip_mcast, ctx->idl) {
+        if (ip_mcast->datapath != dp) {
+            continue;
+        }
+
+        sbrec_ip_multicast_set_seq_no(ip_mcast, ip_mcast->seq_no + 1);
+    }
+}
+
+static void
+sbctl_ip_mcast_flush(struct ctl_context *ctx)
+{
+    const struct sbrec_datapath_binding *dp;
+
+    if (ctx->argc > 2) {
+        return;
+    }
+
+    if (ctx->argc == 2) {
+        const struct ovsdb_idl_row *row;
+        char *error = ctl_get_row(ctx, &sbrec_table_datapath_binding,
+                                  ctx->argv[1], false, &row);
+        if (error) {
+            ctl_fatal("%s", error);
+        }
+
+        dp = (const struct sbrec_datapath_binding *)row;
+        if (!dp) {
+            ctl_fatal("%s is not a valid datapath", ctx->argv[1]);
+        }
+
+        sbctl_ip_mcast_flush_switch(ctx, dp);
+    } else {
+        SBREC_DATAPATH_BINDING_FOR_EACH (dp, ctx->idl) {
+            sbctl_ip_mcast_flush_switch(ctx, dp);
+        }
+    }
+}
+
+static void
 verify_connections(struct ctl_context *ctx)
 {
     const struct sbrec_sb_global *sb_global = sbrec_sb_global_first(ctx->idl);
@@ -948,6 +1023,7 @@ pre_connection(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &sbrec_connection_col_target);
     ovsdb_idl_add_column(ctx->idl, &sbrec_connection_col_read_only);
     ovsdb_idl_add_column(ctx->idl, &sbrec_connection_col_role);
+    ovsdb_idl_add_column(ctx->idl, &sbrec_connection_col_inactivity_probe);
 }
 
 static void
@@ -1010,6 +1086,8 @@ insert_connections(struct ctl_context *ctx, char *targets[], size_t n)
     size_t i, conns=0;
     bool read_only = false;
     char *role = "";
+    const char *inactivity_probe = shash_find_data(&ctx->options,
+                                                   "--inactivity-probe");
 
     /* Insert each connection in a new row in Connection table. */
     connections = xmalloc(n * sizeof *connections);
@@ -1032,6 +1110,11 @@ insert_connections(struct ctl_context *ctx, char *targets[], size_t n)
         sbrec_connection_set_target(connections[conns], targets[i]);
         sbrec_connection_set_read_only(connections[conns], read_only);
         sbrec_connection_set_role(connections[conns], role);
+        if (inactivity_probe) {
+            int64_t msecs = atoll(inactivity_probe);
+            sbrec_connection_set_inactivity_probe(connections[conns],
+                                                  &msecs, 1);
+        }
         conns++;
     }
 
@@ -1155,6 +1238,12 @@ static const struct ctl_table_class tables[SBREC_N_TABLES] = {
 
     [SBREC_TABLE_ADDRESS_SET].row_ids[0]
     = {&sbrec_address_set_col_name, NULL, NULL},
+
+    [SBREC_TABLE_HA_CHASSIS_GROUP].row_ids[0]
+    = {&sbrec_ha_chassis_group_col_name, NULL, NULL},
+
+    [SBREC_TABLE_HA_CHASSIS].row_ids[0]
+    = {&sbrec_ha_chassis_col_chassis, NULL, NULL},
 };
 
 
@@ -1205,6 +1294,9 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
 
             sbctl_context_init(&sbctl_ctx, c, idl, NULL, NULL);
             (c->syntax->prerequisites)(&sbctl_ctx.base);
+            if (sbctl_ctx.base.error) {
+                ctl_fatal("%s", sbctl_ctx.base.error);
+            }
             sbctl_context_done(&sbctl_ctx, c);
 
             ovs_assert(!c->output.string);
@@ -1223,7 +1315,6 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
     struct sbctl_context sbctl_ctx;
     struct ctl_command *c;
     struct shash_node *node;
-    char *error = NULL;
 
     txn = the_idl_txn = ovsdb_idl_txn_create(idl);
     if (dry_run) {
@@ -1235,7 +1326,7 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
     const struct sbrec_sb_global *sb = sbrec_sb_global_first(idl);
     if (!sb) {
         /* XXX add verification that table is empty */
-        sb = sbrec_sb_global_insert(txn);
+        sbrec_sb_global_insert(txn);
     }
 
     symtab = ovsdb_symbol_table_create();
@@ -1248,6 +1339,9 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
         sbctl_context_init_command(&sbctl_ctx, c);
         if (c->syntax->run) {
             (c->syntax->run)(&sbctl_ctx.base);
+        }
+        if (sbctl_ctx.base.error) {
+            ctl_fatal("%s", sbctl_ctx.base.error);
         }
         sbctl_context_done_command(&sbctl_ctx, c);
 
@@ -1284,11 +1378,13 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
             if (c->syntax->postprocess) {
                 sbctl_context_init(&sbctl_ctx, c, idl, txn, symtab);
                 (c->syntax->postprocess)(&sbctl_ctx.base);
+                if (sbctl_ctx.base.error) {
+                    ctl_fatal("%s", sbctl_ctx.base.error);
+                }
                 sbctl_context_done(&sbctl_ctx, c);
             }
         }
     }
-    error = xstrdup(ovsdb_idl_txn_get_error(txn));
 
     switch (status) {
     case TXN_UNCOMMITTED:
@@ -1307,7 +1403,7 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
         goto try_again;
 
     case TXN_ERROR:
-        ctl_fatal("transaction error: %s", error);
+        ctl_fatal("transaction error: %s", ovsdb_idl_txn_get_error(txn));
 
     case TXN_NOT_LOCKED:
         /* Should not happen--we never call ovsdb_idl_set_lock(). */
@@ -1316,7 +1412,6 @@ do_sbctl(const char *args, struct ctl_command *commands, size_t n_commands,
     default:
         OVS_NOT_REACHED();
     }
-    free(error);
 
     ovsdb_symbol_table_destroy(symtab);
 
@@ -1373,7 +1468,6 @@ try_again:
         table_destroy(c->table);
         free(c->table);
     }
-    free(error);
     return false;
 }
 
@@ -1417,11 +1511,15 @@ static const struct ctl_command_syntax sbctl_commands[] = {
      pre_get_info, cmd_lflow_list, NULL,
      "--uuid,--ovs?,--stats", RO}, /* Friendly alias for lflow-list */
 
+    /* IP multicast commands. */
+    {"ip-multicast-flush", 0, 1, "SWITCH",
+     pre_get_info, sbctl_ip_mcast_flush, NULL, "", RW },
+
     /* Connection commands. */
     {"get-connection", 0, 0, "", pre_connection, cmd_get_connection, NULL, "", RO},
     {"del-connection", 0, 0, "", pre_connection, cmd_del_connection, NULL, "", RW},
     {"set-connection", 1, INT_MAX, "TARGET...", pre_connection, cmd_set_connection,
-     NULL, "", RW},
+     NULL, "--inactivity-probe=", RW},
 
     /* SSL commands. */
     {"get-ssl", 0, 0, "", pre_cmd_get_ssl, cmd_get_ssl, NULL, "", RO},
@@ -1437,6 +1535,7 @@ static const struct ctl_command_syntax sbctl_commands[] = {
 static void
 sbctl_cmd_init(void)
 {
-    ctl_init(sbrec_table_classes, tables, cmd_show_tables, sbctl_exit);
+    ctl_init(&sbrec_idl_class, sbrec_table_classes, tables,
+             cmd_show_tables, sbctl_exit);
     ctl_register_commands(sbctl_commands);
 }

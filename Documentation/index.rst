@@ -59,11 +59,17 @@ vSwitch? Start here.
   :doc:`intro/install/windows` |
   :doc:`intro/install/xenserver` |
   :doc:`intro/install/dpdk` |
+  :doc:`intro/install/afxdp` |
   :doc:`Installation FAQs <faq/releases>`
 
-- **Tutorials:** :doc:`tutorials/ovs-advanced` |
+- **Tutorials:** :doc:`tutorials/faucet` |
+  :doc:`tutorials/ovs-advanced` |
   :doc:`tutorials/ovn-sandbox` |
-  :doc:`tutorials/ovn-openstack`
+  :doc:`tutorials/ovn-openstack` |
+  :doc:`tutorials/ovs-conntrack` |
+  :doc:`tutorials/ipsec` |
+  :doc:`tutorials/ovn-ipsec` |
+  :doc:`tutorials/ovn-rbac`
 
 Deeper Dive
 -----------
@@ -82,7 +88,7 @@ Deeper Dive
 
 - **Reference Guides:** :doc:`ref/index`
 
-- **Testing** :doc:`topics/testing`
+- **Testing** :doc:`topics/testing` :doc:`topics/fuzzing/index`
 
 - **Packaging:** :doc:`intro/install/debian` |
   :doc:`intro/install/rhel` |
@@ -105,9 +111,11 @@ Learn more about the Open vSwitch project and about how you can contribute:
   :doc:`internals/contributing/coding-style` |
   :doc:`internals/contributing/coding-style-windows`
 
-- **Maintaining:** :doc:`internals/maintainers` |
+- **Maintaining:** :doc:`internals/charter` |
+  :doc:`internals/maintainers` |
   :doc:`internals/committer-responsibilities` |
-  :doc:`internals/committer-grant-revocation`
+  :doc:`internals/committer-grant-revocation` |
+  :doc:`internals/committer-emeritus-status`
 
 - **Documentation:** :doc:`internals/contributing/documentation-style` |
   :doc:`Building Open vSwitch Documentation <intro/install/documentation>` |

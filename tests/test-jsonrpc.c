@@ -26,7 +26,7 @@
 #include "daemon.h"
 #include "openvswitch/json.h"
 #include "ovstest.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "stream-ssl.h"
 #include "stream.h"
 #include "timeval.h"
@@ -124,7 +124,7 @@ parse_json(const char *s)
 {
     struct json *json = json_from_string(s);
     if (json->type == JSON_STRING) {
-        ovs_fatal(0, "\"%s\": %s", s, json->u.string);
+        ovs_fatal(0, "\"%s\": %s", s, json->string);
     }
     return json;
 }
@@ -272,7 +272,7 @@ do_request(struct ovs_cmdl_context *ctx)
     }
 
     error = stream_open_block(jsonrpc_stream_open(ctx->argv[1], &stream,
-                              DSCP_DEFAULT), &stream);
+                              DSCP_DEFAULT), -1, &stream);
     if (error) {
         ovs_fatal(error, "could not open \"%s\"", ctx->argv[1]);
     }
@@ -312,7 +312,7 @@ do_notify(struct ovs_cmdl_context *ctx)
     }
 
     error = stream_open_block(jsonrpc_stream_open(ctx->argv[1], &stream,
-                              DSCP_DEFAULT), &stream);
+                              DSCP_DEFAULT), -1, &stream);
     if (error) {
         ovs_fatal(error, "could not open \"%s\"", ctx->argv[1]);
     }

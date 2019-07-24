@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Nicira, Inc.
+ * Copyright (c) 2015, 2018 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <errno.h>
 
 #include "ct-dpif.h"
+#include "openvswitch/ofp-parse.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ct_dpif);
@@ -110,20 +111,142 @@ ct_dpif_dump_done(struct ct_dpif_dump_state *dump)
             : EOPNOTSUPP);
 }
 
-/* Flush the entries in the connection tracker used by 'dpif'.
+/* Flush the entries in the connection tracker used by 'dpif'.  The
+ * arguments have the following behavior:
  *
- * If 'zone' is not NULL, flush only the entries in '*zone'. */
+ *   - If both 'zone' and 'tuple' are NULL, flush all the conntrack entries.
+ *   - If 'zone' is not NULL, and 'tuple' is NULL, flush all the conntrack
+ *     entries in '*zone'.
+ *   - If 'tuple' is not NULL, flush the conntrack entry specified by 'tuple'
+ *     in '*zone'. If 'zone' is NULL, use the default zone (zone 0). */
 int
-ct_dpif_flush(struct dpif *dpif, const uint16_t *zone)
+ct_dpif_flush(struct dpif *dpif, const uint16_t *zone,
+              const struct ct_dpif_tuple *tuple)
 {
-    if (zone) {
-        VLOG_DBG("%s: ct_flush: %"PRIu16, dpif_name(dpif), *zone);
+    if (tuple) {
+        struct ds ds = DS_EMPTY_INITIALIZER;
+        ct_dpif_format_tuple(&ds, tuple);
+        VLOG_DBG("%s: ct_flush: %s in zone %d", dpif_name(dpif), ds_cstr(&ds),
+                                                zone ? *zone : 0);
+        ds_destroy(&ds);
+    } else if (zone) {
+        VLOG_DBG("%s: ct_flush: zone %"PRIu16, dpif_name(dpif), *zone);
     } else {
         VLOG_DBG("%s: ct_flush: <all>", dpif_name(dpif));
     }
 
     return (dpif->dpif_class->ct_flush
-            ? dpif->dpif_class->ct_flush(dpif, zone)
+            ? dpif->dpif_class->ct_flush(dpif, zone, tuple)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_set_maxconns(struct dpif *dpif, uint32_t maxconns)
+{
+    return (dpif->dpif_class->ct_set_maxconns
+            ? dpif->dpif_class->ct_set_maxconns(dpif, maxconns)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_get_maxconns(struct dpif *dpif, uint32_t *maxconns)
+{
+    return (dpif->dpif_class->ct_get_maxconns
+            ? dpif->dpif_class->ct_get_maxconns(dpif, maxconns)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_get_nconns(struct dpif *dpif, uint32_t *nconns)
+{
+    return (dpif->dpif_class->ct_get_nconns
+            ? dpif->dpif_class->ct_get_nconns(dpif, nconns)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_set_limits(struct dpif *dpif, const uint32_t *default_limit,
+                   const struct ovs_list *zone_limits)
+{
+    return (dpif->dpif_class->ct_set_limits
+            ? dpif->dpif_class->ct_set_limits(dpif, default_limit,
+                                              zone_limits)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_get_limits(struct dpif *dpif, uint32_t *default_limit,
+                   const struct ovs_list *zone_limits_in,
+                   struct ovs_list *zone_limits_out)
+{
+    return (dpif->dpif_class->ct_get_limits
+            ? dpif->dpif_class->ct_get_limits(dpif, default_limit,
+                                              zone_limits_in,
+                                              zone_limits_out)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_del_limits(struct dpif *dpif, const struct ovs_list *zone_limits)
+{
+    return (dpif->dpif_class->ct_del_limits
+            ? dpif->dpif_class->ct_del_limits(dpif, zone_limits)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_set_enabled(struct dpif *dpif, bool v6, bool enable)
+{
+    return (dpif->dpif_class->ipf_set_enabled
+            ? dpif->dpif_class->ipf_set_enabled(dpif, v6, enable)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_set_min_frag(struct dpif *dpif, bool v6, uint32_t min_frag)
+{
+    return (dpif->dpif_class->ipf_set_min_frag
+            ? dpif->dpif_class->ipf_set_min_frag(dpif, v6, min_frag)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_set_max_nfrags(struct dpif *dpif, uint32_t max_frags)
+{
+    return (dpif->dpif_class->ipf_set_max_nfrags
+            ? dpif->dpif_class->ipf_set_max_nfrags(dpif, max_frags)
+            : EOPNOTSUPP);
+}
+
+int ct_dpif_ipf_get_status(struct dpif *dpif,
+                           struct dpif_ipf_status *dpif_ipf_status)
+{
+    return (dpif->dpif_class->ipf_get_status
+            ? dpif->dpif_class->ipf_get_status(dpif, dpif_ipf_status)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_dump_start(struct dpif *dpif, struct ipf_dump_ctx **dump_ctx)
+{
+    return (dpif->dpif_class->ipf_dump_start
+           ? dpif->dpif_class->ipf_dump_start(dpif, dump_ctx)
+           : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_dump_next(struct dpif *dpif, void *dump_ctx,  char **dump)
+{
+    return (dpif->dpif_class->ipf_dump_next
+            ? dpif->dpif_class->ipf_dump_next(dpif, dump_ctx, dump)
+            : EOPNOTSUPP);
+}
+
+int
+ct_dpif_ipf_dump_done(struct dpif *dpif, void *dump_ctx)
+{
+    return (dpif->dpif_class->ipf_dump_done
+            ? dpif->dpif_class->ipf_dump_done(dpif, dump_ctx)
             : EOPNOTSUPP);
 }
 
@@ -305,6 +428,12 @@ const char *ct_dpif_tcp_state_string[] = {
 #undef CT_DPIF_TCP_STATE
 };
 
+const char *ct_dpif_sctp_state_string[] = {
+#define CT_DPIF_SCTP_STATE(STATE) [CT_DPIF_SCTP_STATE_##STATE] = #STATE,
+    CT_DPIF_SCTP_STATES
+#undef CT_DPIF_SCTP_STATE
+};
+
 static void
 ct_dpif_format_enum__(struct ds *ds, const char *title, unsigned int state,
                       const char *names[], unsigned int max)
@@ -375,6 +504,16 @@ ct_dpif_format_protoinfo_tcp_verbose(struct ds *ds,
 }
 
 static void
+ct_dpif_format_protoinfo_sctp(struct ds *ds,
+                              const struct ct_dpif_protoinfo *protoinfo)
+{
+    ct_dpif_format_enum(ds, "state=", protoinfo->sctp.state,
+                        ct_dpif_sctp_state_string);
+    ds_put_format(ds, ",vtag_orig=%" PRIu32 ",vtag_reply=%" PRIu32,
+                  protoinfo->sctp.vtag_orig, protoinfo->sctp.vtag_reply);
+}
+
+static void
 ct_dpif_format_protoinfo(struct ds *ds, const char *title,
                          const struct ct_dpif_protoinfo *protoinfo,
                          bool verbose)
@@ -390,6 +529,9 @@ ct_dpif_format_protoinfo(struct ds *ds, const char *title,
             } else {
                 ct_dpif_format_protoinfo_tcp(ds, protoinfo);
             }
+            break;
+        case IPPROTO_SCTP:
+            ct_dpif_format_protoinfo_sctp(ds, protoinfo);
             break;
         }
         if (title) {
@@ -422,4 +564,200 @@ ct_dpif_format_tcp_stat(struct ds * ds, int tcp_state, int conn_per_state)
     ct_dpif_format_enum(ds, "\t  [", tcp_state, ct_dpif_tcp_state_string);
     ds_put_cstr(ds, "]");
     ds_put_format(ds, "=%u", conn_per_state);
+}
+
+/* Parses a specification of a conntrack 5-tuple from 's' into 'tuple'.
+ * Returns true on success.  Otherwise, returns false and puts the error
+ * message in 'ds'. */
+bool
+ct_dpif_parse_tuple(struct ct_dpif_tuple *tuple, const char *s, struct ds *ds)
+{
+    char *pos, *key, *value, *copy;
+    memset(tuple, 0, sizeof *tuple);
+
+    pos = copy = xstrdup(s);
+    while (ofputil_parse_key_value(&pos, &key, &value)) {
+        if (!*value) {
+            ds_put_format(ds, "field %s missing value", key);
+            goto error;
+        }
+
+        if (!strcmp(key, "ct_nw_src") || !strcmp(key, "ct_nw_dst")) {
+            if (tuple->l3_type && tuple->l3_type != AF_INET) {
+                ds_put_cstr(ds, "L3 type set multiple times");
+                goto error;
+            } else {
+                tuple->l3_type = AF_INET;
+            }
+            if (!ip_parse(value, key[6] == 's' ? &tuple->src.ip :
+                                                 &tuple->dst.ip)) {
+                goto error_with_msg;
+            }
+        } else if (!strcmp(key, "ct_ipv6_src") ||
+                   !strcmp(key, "ct_ipv6_dst")) {
+            if (tuple->l3_type && tuple->l3_type != AF_INET6) {
+                ds_put_cstr(ds, "L3 type set multiple times");
+                goto error;
+            } else {
+                tuple->l3_type = AF_INET6;
+            }
+            if (!ipv6_parse(value, key[8] == 's' ? &tuple->src.in6 :
+                                                   &tuple->dst.in6)) {
+                goto error_with_msg;
+            }
+        } else if (!strcmp(key, "ct_nw_proto")) {
+            char *err = str_to_u8(value, key, &tuple->ip_proto);
+            if (err) {
+                free(err);
+                goto error_with_msg;
+            }
+        } else if (!strcmp(key, "ct_tp_src") || !strcmp(key,"ct_tp_dst")) {
+            uint16_t port;
+            char *err = str_to_u16(value, key, &port);
+            if (err) {
+                free(err);
+                goto error_with_msg;
+            }
+            if (key[6] == 's') {
+                tuple->src_port = htons(port);
+            } else {
+                tuple->dst_port = htons(port);
+            }
+        } else if (!strcmp(key, "icmp_type") || !strcmp(key, "icmp_code") ||
+                   !strcmp(key, "icmp_id") ) {
+            if (tuple->ip_proto != IPPROTO_ICMP &&
+                tuple->ip_proto != IPPROTO_ICMPV6) {
+                ds_put_cstr(ds, "invalid L4 fields");
+                goto error;
+            }
+            uint16_t icmp_id;
+            char *err;
+            if (key[5] == 't') {
+                err = str_to_u8(value, key, &tuple->icmp_type);
+            } else if (key[5] == 'c') {
+                err = str_to_u8(value, key, &tuple->icmp_code);
+            } else {
+                err = str_to_u16(value, key, &icmp_id);
+                tuple->icmp_id = htons(icmp_id);
+            }
+            if (err) {
+                free(err);
+                goto error_with_msg;
+            }
+        } else {
+            ds_put_format(ds, "invalid conntrack tuple field: %s", key);
+            goto error;
+        }
+    }
+
+    if (ipv6_is_zero(&tuple->src.in6) || ipv6_is_zero(&tuple->dst.in6) ||
+        !tuple->ip_proto) {
+        /* icmp_type, icmp_code, and icmp_id can be 0. */
+        if (tuple->ip_proto != IPPROTO_ICMP &&
+            tuple->ip_proto != IPPROTO_ICMPV6) {
+            if (!tuple->src_port || !tuple->dst_port) {
+                ds_put_cstr(ds, "at least one of the conntrack 5-tuple fields "
+                                "is missing.");
+                goto error;
+            }
+        }
+    }
+
+    free(copy);
+    return true;
+
+error_with_msg:
+    ds_put_format(ds, "failed to parse field %s", key);
+error:
+    free(copy);
+    return false;
+}
+
+void
+ct_dpif_push_zone_limit(struct ovs_list *zone_limits, uint16_t zone,
+                        uint32_t limit, uint32_t count)
+{
+    struct ct_dpif_zone_limit *zone_limit = xmalloc(sizeof *zone_limit);
+    zone_limit->zone = zone;
+    zone_limit->limit = limit;
+    zone_limit->count = count;
+    ovs_list_push_back(zone_limits, &zone_limit->node);
+}
+
+void
+ct_dpif_free_zone_limits(struct ovs_list *zone_limits)
+{
+    while (!ovs_list_is_empty(zone_limits)) {
+        struct ovs_list *entry = ovs_list_pop_front(zone_limits);
+        struct ct_dpif_zone_limit *cdzl;
+        cdzl = CONTAINER_OF(entry, struct ct_dpif_zone_limit, node);
+        free(cdzl);
+    }
+}
+
+/* Parses a specification of a conntrack zone limit from 's' into '*pzone'
+ * and '*plimit'.  Returns true on success.  Otherwise, returns false and
+ * and puts the error message in 'ds'. */
+bool
+ct_dpif_parse_zone_limit_tuple(const char *s, uint16_t *pzone,
+                               uint32_t *plimit, struct ds *ds)
+{
+    char *pos, *key, *value, *copy, *err;
+    bool parsed_limit = false, parsed_zone = false;
+
+    pos = copy = xstrdup(s);
+    while (ofputil_parse_key_value(&pos, &key, &value)) {
+        if (!*value) {
+            ds_put_format(ds, "field %s missing value", key);
+            goto error;
+        }
+
+        if (!strcmp(key, "zone")) {
+            err = str_to_u16(value, key, pzone);
+            if (err) {
+                free(err);
+                goto error_with_msg;
+            }
+            parsed_zone = true;
+        }  else if (!strcmp(key, "limit")) {
+            err = str_to_u32(value, plimit);
+            if (err) {
+                free(err);
+                goto error_with_msg;
+            }
+            parsed_limit = true;
+        } else {
+            ds_put_format(ds, "invalid zone limit field: %s", key);
+            goto error;
+        }
+    }
+
+    if (!parsed_zone || !parsed_limit) {
+        ds_put_format(ds, "failed to parse zone limit");
+        goto error;
+    }
+
+    free(copy);
+    return true;
+
+error_with_msg:
+    ds_put_format(ds, "failed to parse field %s", key);
+error:
+    free(copy);
+    return false;
+}
+
+void
+ct_dpif_format_zone_limits(uint32_t default_limit,
+                           const struct ovs_list *zone_limits, struct ds *ds)
+{
+    struct ct_dpif_zone_limit *zone_limit;
+
+    ds_put_format(ds, "default limit=%"PRIu32, default_limit);
+
+    LIST_FOR_EACH (zone_limit, node, zone_limits) {
+        ds_put_format(ds, "\nzone=%"PRIu16, zone_limit->zone);
+        ds_put_format(ds, ",limit=%"PRIu32, zone_limit->limit);
+        ds_put_format(ds, ",count=%"PRIu32, zone_limit->count);
+    }
 }

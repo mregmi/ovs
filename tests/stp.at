@@ -429,9 +429,7 @@ AT_CHECK([ovs-ofctl add-flow br1 "in_port=8 icmp actions=2"])
 AT_CHECK([ovs-ofctl add-flow br1 "in_port=2 icmp actions=8"])
 
 # give time for STP to move initially
-
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
+ovs-appctl time/warp 6000 3000
 
 AT_CHECK([cat ovs-vswitchd.log | FILTER_STP_TOPOLOGY_LISTENING], [0], [dnl
 port <>: STP state changed from disabled to listening
@@ -446,17 +444,7 @@ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(8),eth(src=50:54:00:00:00:
 ])
 
 # give time for STP to synchronize
-
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
+ovs-appctl time/warp 30000 3000
 
 AT_CHECK([cat ovs-vswitchd.log | FILTER_STP_TOPOLOGY], [0], [dnl
 port <>: STP state changed from disabled to listening
@@ -524,8 +512,7 @@ ovs-appctl netdev-dummy/set-admin-state up
 ovs-appctl time/stop
 
 # give time for STP to move initially
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
+ovs-appctl time/warp 6000 3000
 
 AT_CHECK([cat ovs-vswitchd.log | FILTER_STP_TOPOLOGY_LISTENING], [0], [dnl
 port <>: STP state changed from disabled to listening
@@ -537,17 +524,7 @@ port <>: STP state changed from disabled to listening
 ])
 
 # give time for STP to synchronize
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
+ovs-appctl time/warp 30000 3000
 
 AT_CHECK([cat ovs-vswitchd.log | FILTER_STP_TOPOLOGY_FORWARDING], [0], [dnl
 port <>: STP state changed from learning to forwarding
@@ -566,9 +543,7 @@ port <>: STP state changed from learning to forwarding
 # of stp ports will stop after 1s. So the root bridge can send quickly
 # topology change ack (other bridges may send TCN BPDU to root bridge) for
 # avoiding root brdige to flush fdb and mdb frequently.
-for i in $(seq 0 35); do
-    ovs-appctl time/warp 1000
-done
+ovs-appctl time/warp 36000 1000
 
 # root bridge sends query packet
 # we don't want to lose that message, so send it twice
@@ -587,24 +562,14 @@ OVS_WAIT_UNTIL([ovs-appctl mdb/show br0 | grep 'querier'])
 OVS_WAIT_UNTIL([ovs-appctl mdb/show br1 | grep 'querier'])
 OVS_WAIT_UNTIL([ovs-appctl mdb/show br2 | grep 'querier'])
 
+# Make sure that  validation of flows was before changing of topology.
+ovs-appctl revalidator/wait
+
 # del p2 on the br0, the topology will be changed
 AT_CHECK([ovs-vsctl del-port br0 p2])
 
 # give time for STP to synchronize
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
-
-ovs-appctl time/warp 3000
-ovs-appctl time/warp 3000
+ovs-appctl time/warp 36000 3000
 
 # check fdb and mdb
 AT_CHECK([ovs-appctl fdb/show br0], [0], [dnl
@@ -652,15 +617,13 @@ ovs-appctl netdev-dummy/set-admin-state up
 ovs-appctl time/stop
 
 # give time for STP to move initially
-for i in $(seq 0 30); do
-    ovs-appctl time/warp 1000
-done
+ovs-appctl time/warp 31000 1000
 
 AT_CHECK([ovs-appctl stp/show br0 | grep p1], [0], [dnl
-	p1         designated forwarding 19    128.1
+  p1         designated forwarding 19    128.1
 ])
 AT_CHECK([ovs-appctl stp/show br0 | grep p2], [0], [dnl
-	p2         designated forwarding 19    128.2
+  p2         designated forwarding 19    128.2
 ])
 
 # add a stp port
@@ -674,10 +637,10 @@ ovs-appctl netdev-dummy/set-admin-state p3 down
 
 # We should not show the p3 because its link-state is down
 AT_CHECK([ovs-appctl stp/show br0 | grep p1], [0], [dnl
-	p1         designated forwarding 19    128.1
+  p1         designated forwarding 19    128.1
 ])
 AT_CHECK([ovs-appctl stp/show br0 | grep p2], [0], [dnl
-	p2         designated forwarding 19    128.2
+  p2         designated forwarding 19    128.2
 ])
 AT_CHECK([ovs-appctl stp/show br0 | grep p3], [1], [dnl
 ])
@@ -685,13 +648,13 @@ AT_CHECK([ovs-appctl stp/show br0 | grep p3], [1], [dnl
 ovs-appctl netdev-dummy/set-admin-state p3 up
 
 AT_CHECK([ovs-appctl stp/show br0 | grep p1], [0], [dnl
-	p1         designated forwarding 19    128.1
+  p1         designated forwarding 19    128.1
 ])
 AT_CHECK([ovs-appctl stp/show br0 | grep p2], [0], [dnl
-	p2         designated forwarding 19    128.2
+  p2         designated forwarding 19    128.2
 ])
 AT_CHECK([ovs-appctl stp/show br0 | grep p3], [0], [dnl
-	p3         designated listening  19    128.3
+  p3         designated listening  19    128.3
 ])
 
 

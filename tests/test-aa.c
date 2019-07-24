@@ -26,11 +26,11 @@
 #define ETH_TYPE_LLDP   0x88cc
 
 /* Dummy MAC addresses */
-static const struct eth_addr chassis_mac = { { { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad } } };
-static const struct eth_addr eth_src = { { { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad } } };
+static const struct eth_addr chassis_mac = ETH_ADDR_C(5e,10,8e,e7,84,ad);
+static const struct eth_addr eth_src = ETH_ADDR_C(5e,10,8e,e7,84,ad);
 
 /* LLDP multicast address */
-static const struct eth_addr eth_addr_lldp = { { { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e } } };
+static const struct eth_addr eth_addr_lldp = ETH_ADDR_C(01,80,c2,00,00,0e);
 
 /* Count of tests run */
 static int num_tests = 0;
@@ -47,8 +47,6 @@ check_received_port(struct lldpd_port *sport,
     assert(rport->p_id_len == sport->p_id_len);
     assert(strncmp(rport->p_id, sport->p_id, sport->p_id_len) == 0);
     assert(strcmp(rport->p_descr, sport->p_descr) == 0);
-
-    return;
 }
 
 
@@ -66,8 +64,6 @@ check_received_chassis(struct lldpd_chassis *schassis,
     assert(strcmp(rchassis->c_descr, schassis->c_descr) == 0);
     assert(rchassis->c_cap_available == schassis->c_cap_available);
     assert(rchassis->c_cap_enabled == schassis->c_cap_enabled);
-
-    return;
 }
 
 
@@ -113,8 +109,6 @@ check_received_aa(struct lldpd_port *sport,
         i++;
     }
     assert(i == 2);
-
-    return;
 }
 
 

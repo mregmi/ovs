@@ -81,8 +81,13 @@ struct stt_dev {
 #define STT_PROTO_TCP		BIT(3)
 #define STT_PROTO_TYPES		(STT_PROTO_IPV4 | STT_PROTO_TCP)
 
+#ifdef HAVE_SKB_GSO_UDP
 #define SUPPORTED_GSO_TYPES (SKB_GSO_TCPV4 | SKB_GSO_UDP | SKB_GSO_DODGY | \
 			     SKB_GSO_TCPV6)
+#else
+#define SUPPORTED_GSO_TYPES (SKB_GSO_TCPV4 | SKB_GSO_DODGY | \
+			     SKB_GSO_TCPV6)
+#endif
 
 /* The length and offset of a fragment are encoded in the sequence number.
  * STT_SEQ_LEN_SHIFT is the left shift needed to store the length.
@@ -234,9 +239,7 @@ static void copy_skb_metadata(struct sk_buff *to, struct sk_buff *from)
 	to->priority = from->priority;
 	to->mark = from->mark;
 	to->vlan_tci = from->vlan_tci;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	to->vlan_proto = from->vlan_proto;
-#endif
 	skb_copy_secmark(to, from);
 }
 
@@ -559,12 +562,6 @@ static int __try_to_segment(struct sk_buff *skb, bool csum_partial,
 
 static int try_to_segment(struct sk_buff *skb)
 {
-#ifdef SKIP_ZERO_COPY
-	/* coalesce_skb() since does not generate frag-list no need to
-	 * linearize it here.
-	 */
-	return 0;
-#else
 	struct stthdr *stth = stt_hdr(skb);
 	bool csum_partial = !!(stth->flags & STT_CSUM_PARTIAL);
 	bool ipv4 = !!(stth->flags & STT_PROTO_IPV4);
@@ -572,7 +569,6 @@ static int try_to_segment(struct sk_buff *skb)
 	int l4_offset = stth->l4_offset;
 
 	return __try_to_segment(skb, csum_partial, ipv4, tcp, l4_offset);
-#endif
 }
 
 static int segment_skb(struct sk_buff **headp, bool csum_partial,
@@ -757,10 +753,8 @@ static int stt_can_offload(struct sk_buff *skb, __be16 l3_proto, u8 l4_proto)
 	if (skb->len + STT_HEADER_LEN + sizeof(struct iphdr) > 65535)
 		return 0;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	if (skb_vlan_tag_present(skb) && skb->vlan_proto != htons(ETH_P_8021Q))
 		return 0;
-#endif
 	return 1;
 }
 
@@ -787,7 +781,6 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb, int min_headroom)
 {
 	int err;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	if (skb_vlan_tag_present(skb) && skb->vlan_proto != htons(ETH_P_8021Q)) {
 
 		min_headroom += VLAN_HLEN;
@@ -807,7 +800,6 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb, int min_headroom)
 			goto error;
 		}
 	}
-#endif
 
 	if (skb_is_gso(skb)) {
 		struct sk_buff *nskb;
@@ -980,7 +972,8 @@ err_free_rt:
 static struct rtable *stt_get_rt(struct sk_buff *skb,
 				 struct net_device *dev,
 				 struct flowi4 *fl,
-				 const struct ip_tunnel_key *key)
+				 const struct ip_tunnel_key *key,
+				 __be16 dport, __be16 sport)
 {
 	struct net *net = dev_net(dev);
 
@@ -991,6 +984,8 @@ static struct rtable *stt_get_rt(struct sk_buff *skb,
 	fl->flowi4_tos = RT_TOS(key->tos);
 	fl->flowi4_mark = skb->mark;
 	fl->flowi4_proto = IPPROTO_TCP;
+	fl->fl4_dport = dport;
+	fl->fl4_sport = sport;
 
 	return ip_route_output_key(net, fl);
 }
@@ -1017,14 +1012,14 @@ netdev_tx_t ovs_stt_xmit(struct sk_buff *skb)
 
 	tun_key = &tun_info->key;
 
-	rt = stt_get_rt(skb, dev, &fl, tun_key);
+	sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+	rt = stt_get_rt(skb, dev, &fl, tun_key, dport, sport);
 	if (IS_ERR(rt)) {
 		err = PTR_ERR(rt);
 		goto error;
 	}
 
 	df = tun_key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
-	sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
 	skb->ignore_df = 1;
 
 	stt_xmit_skb(skb, rt, fl.saddr, tun_key->u.ipv4.dst,
@@ -1034,7 +1029,7 @@ netdev_tx_t ovs_stt_xmit(struct sk_buff *skb)
 error:
 	kfree_skb(skb);
 	dev->stats.tx_errors++;
-	return NETDEV_TX_OK;
+	return err;
 }
 EXPORT_SYMBOL(ovs_stt_xmit);
 
@@ -1304,13 +1299,13 @@ static bool validate_checksum(struct sk_buff *skb)
 	skb->csum = csum_tcpudp_nofold(iph->saddr, iph->daddr, skb->len,
 				       IPPROTO_TCP, 0);
 
-	return __tcp_checksum_complete(skb) == 0;
+	return __skb_checksum_complete(skb) == 0;
 }
 
 static bool set_offloads(struct sk_buff *skb)
 {
 	struct stthdr *stth = stt_hdr(skb);
-	unsigned short gso_type;
+	unsigned int gso_type = 0;
 	int l3_header_size;
 	int l4_header_size;
 	u16 csum_offset;
@@ -1351,7 +1346,9 @@ static bool set_offloads(struct sk_buff *skb)
 	case STT_PROTO_IPV4:
 		/* UDP/IPv4 */
 		csum_offset = offsetof(struct udphdr, check);
+#ifdef HAVE_SKB_GSO_UDP
 		gso_type = SKB_GSO_UDP;
+#endif
 		l3_header_size = sizeof(struct iphdr);
 		l4_header_size = sizeof(struct udphdr);
 		skb->protocol = htons(ETH_P_IP);
@@ -1359,7 +1356,9 @@ static bool set_offloads(struct sk_buff *skb)
 	default:
 		/* UDP/IPv6 */
 		csum_offset = offsetof(struct udphdr, check);
+#ifdef HAVE_SKB_GSO_UDP
 		gso_type = SKB_GSO_UDP;
+#endif
 		l3_header_size = sizeof(struct ipv6hdr);
 		l4_header_size = sizeof(struct udphdr);
 		skb->protocol = htons(ETH_P_IPV6);
@@ -1707,9 +1706,6 @@ static void stt_cleanup(struct net *net)
 	int i;
 
 	sn->n_tunnels--;
-	if (sn->n_tunnels)
-		goto out;
-out:
 	n_tunnels--;
 	if (n_tunnels)
 		return;
@@ -1822,20 +1818,22 @@ int ovs_stt_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 	struct stt_dev *stt_dev = netdev_priv(dev);
 	struct net *net = stt_dev->net;
 	__be16 dport = stt_dev->dst_port;
+	__be16 sport;
 	struct flowi4 fl4;
 	struct rtable *rt;
 
 	if (ip_tunnel_info_af(info) != AF_INET)
 		return -EINVAL;
 
-	rt = stt_get_rt(skb, dev, &fl4, &info->key);
+	sport = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+	rt = stt_get_rt(skb, dev, &fl4, &info->key, dport, sport);
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
 
 	ip_rt_put(rt);
 
 	info->key.u.ipv4.src = fl4.saddr;
-	info->key.tp_src = udp_flow_src_port(net, skb, 1, USHRT_MAX, true);
+	info->key.tp_src = sport;
 	info->key.tp_dst = dport;
 	return 0;
 }
@@ -1848,7 +1846,12 @@ static const struct net_device_ops stt_netdev_ops = {
 	.ndo_stop               = stt_stop,
 	.ndo_start_xmit         = stt_dev_xmit,
 	.ndo_get_stats64        = ip_tunnel_get_stats64,
+#ifdef  HAVE_RHEL7_MAX_MTU
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_change_mtu = stt_change_mtu,
+#else
 	.ndo_change_mtu         = stt_change_mtu,
+#endif
 	.ndo_validate_addr      = eth_validate_addr,
 	.ndo_set_mac_address    = eth_mac_addr,
 #ifdef USE_UPSTREAM_TUNNEL
@@ -1909,7 +1912,12 @@ static const struct nla_policy stt_policy[IFLA_STT_MAX + 1] = {
 	[IFLA_STT_PORT]              = { .type = NLA_U16 },
 };
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int stt_validate(struct nlattr *tb[], struct nlattr *data[],
+			struct netlink_ext_ack __always_unused *extack)
+#else
 static int stt_validate(struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	if (tb[IFLA_ADDRESS]) {
 		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN)
@@ -1961,8 +1969,14 @@ static int stt_configure(struct net *net, struct net_device *dev,
 	return 0;
 }
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int stt_newlink(struct net *net, struct net_device *dev,
+		struct nlattr *tb[], struct nlattr *data[],
+		struct netlink_ext_ack __always_unused *extack)
+#else
 static int stt_newlink(struct net *net, struct net_device *dev,
 		struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	__be16 dst_port = htons(STT_DST_PORT);
 
@@ -2099,7 +2113,9 @@ int stt_init_module(void)
 	if (rc)
 		goto out2;
 
+#ifdef HAVE_LIST_IN_NF_HOOK_OPS
 	INIT_LIST_HEAD(&nf_hook_ops.list);
+#endif
 	pr_info("STT tunneling driver\n");
 	return 0;
 out2:
